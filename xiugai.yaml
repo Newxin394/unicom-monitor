@@ -1,0 +1,443 @@
+# ==================== 通用配置 ====================
+mixed-port: 7890
+# 未使用 eBPF 时并不需要这几个监听器，注释掉可省一点资源（如需 redis 又要用再打开）
+redir-port: 9797
+tproxy-port: 9898
+ipv6: true
+allow-lan: true
+unified-delay: true
+tcp-concurrent: true
+# 【优化】默认 info 级别每条连接都写日志，高流量时很吃 CPU；warning 只记异常，无感知
+log-level: warning
+external-controller: 127.0.0.1:9090
+external-ui: ui
+external-ui-url: "https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip"
+# 【优化】always = 每条连接都查进程，CPU 大户；strict = 仅命中 PROCESS-NAME 规则时才查，你所有按进程的规则（Emby/游戏/多TTS）照常生效
+find-process-mode: strict
+profile:
+  store-selected: true
+  store-fake-ip: true
+
+# ==================== 流量嗅探 ====================
+sniffer:
+  enable: true
+  sniff:
+    HTTP:
+      ports: [80, 8080, 8443, 8880]
+      override-destination: true
+    TLS:
+      ports: [443, 8443]
+    # 【优化】QUIC 嗅探是开销最大的一项，已关。fake-ip 模式下域名规则靠 DNS 解析就能命中，QUIC/HTTP3 流量路由不受影响（原神等 UDP 游戏走的是 PROCESS-NAME 规则）
+    # QUIC:
+    #   ports: [443, 8443]
+  skip-domain:
+    - "Mijia Cloud"
+    - "+.push.apple.com"
+
+# ==================== TUN 模式 ====================
+tun:
+  enable: false
+  stack: system
+  device: tun0
+  dns-hijack:
+    - "any:53"
+    - "tcp://any:53"
+  auto-route: true
+  auto-redirect: false
+  auto-detect-interface: true
+
+# ==================== EBPF 监听 ====================
+listeners:
+  - name: ebpf-in
+    type: ebpf
+    mode: hybrid                # local（本机）+ shared（热点）同时接管
+    network:
+      - tcp
+      - udp
+    udp-timeout: 30
+    dns-mode: hijack            # 劫持 DNS 交给 mihomo 的 fake-ip
+    bypass-private-address: false
+#    bypass-rule-set:[]            # 命中国内 IP 直接内核直连，不占代理
+    # 【链式相关】cn_ip 这行千万别开：Emby链式 的第一跳是「国内免流」节点，
+    # 服务器本身就是 CN IP，一旦内核层放行就直接绕过 mihomo，中转白做。
+#      - cn_ip
+    local:                      # 本机 cgroup 拦截
+      cgroup-path: ""           # 自动探测 cgroup2 挂载点
+      ipv6-mode: auto
+      include-uid: []
+      include-uid-range: []
+      exclude-uid: []
+      exclude-uid-range: []
+      include-android-user: []
+      include-package: []
+      exclude-package: []
+      # 【优化】65536 → 32768，状态表内存减半；手机并发连接远到不了这个量级
+      state-capacity: 65536
+    shared:                     # 热点转发
+      interface: ["wlan2"]      # ← 改成你实际的热点接口名
+      ipv6-mode: always
+      include-source-cidr: []
+      exclude-source-cidr: []
+      include-mac-address: []
+      exclude-mac-address: []
+      # 【优化】同上
+      state-capacity: 32768
+      advanced:
+        tc-priority: 1
+
+# ==================== DNS 配置 ====================
+dns:
+  enable: true
+  listen: 0.0.0.0:1053
+  ipv6: true
+  respect-rules: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.0/15
+  fake-ip-filter:
+    - "+.lan"
+    - "+.local"
+    - "+.market.xiaomi.com"
+    - "rule-set:Fake-IP-Filter"
+  default-nameserver:
+    - https://120.53.53.53/dns-query
+    - https://223.5.5.5/dns-query
+    - 2400:3200::1
+  proxy-server-nameserver:
+    - https://120.53.53.53/dns-query
+    - https://223.5.5.5/dns-query
+  nameserver:
+    - https://8.8.8.8/dns-query
+    - https://1.1.1.1/dns-query
+  nameserver-policy:
+    "rule-set:cn_domain,private_domain":
+      - https://120.53.53.53/dns-query
+      - https://223.5.5.5/dns-query
+    "+.google.com,+.youtube.com,+.twitter.com,+.openai.com,+.anthropic.com":
+      - https://8.8.8.8/dns-query
+      - https://1.1.1.1/dns-query
+
+# ==================== 订阅提供者 ====================
+p: &p
+  type: http
+  interval: 0
+  proxy: DIRECT
+  header:
+    User-Agent: ["Clash.Meta/mihomo/Alpha/1.18.6"]
+  health-check:
+    enable: true
+    url: http://www.google.com/generate_204
+    # 【优化】300s → 1800s：原来每 5 分钟就把所有节点全测一遍（快乐鸡这类几百节点很吃 CPU/流量），30 分钟足够，且 lazy 模式下只有被用到才测
+    interval: 3600
+    lazy: true
+
+ppp: &ppp
+  type: http
+  interval: 86400
+  health-check:
+    enable: true
+    interval: 18000
+    lazy: true
+    url: https://www.google.com/generate_204
+
+# 国外非免流用：排除杂项，匹配香港/日本/美国等国际节点
+filter2: &filter2 ^(?!.*(?:ipv6|校园|非免|官网|回国|套餐|流量|重置|自定义|封停|以下|由于|tcp))(?=.*(?:隧道|香港|🇭🇰|日本|🇯🇵|美国|🇺🇸|韩国|🇰🇷|新加坡|🇸🇬|xin|ml|免流|Singapore|台湾|德国|de|DE|De|🇹🇼|优选|hy|HY|KR|TW|YM|SG)).*$
+
+# 【新增】Emby 链式落地的筛选口味 —— 与 Emby代理 完全一致（收境外优质地区，排除 HK/JP）
+# 抽成锚点，改一处两边同步，不会再改漏
+filterEmby: &filterEmby ^(?i)(?=.*(?:Emby|德国|DE|de|新加坡|🇸🇬|韩国|🇰🇷|印度|🇮🇳|sg|法国|🇫🇷|瑞士|加拿大|马来西亚|VN|YM|KR|TW|英国|泰国|US|芬兰|优选|CF|SG|tw|台湾|美国))(?!.*(?:HK|JP)).*$
+
+proxy-providers:
+  快乐鸡:
+    path: ./proxies/快乐鸡.yaml
+    <<: *p
+    interval: 0
+    url: "http://x6.846803.xyz:39401/sub-store-api/download/%E6%96%B0"
+  国外免:
+    path: ./proxies/国外免.yaml
+    <<: *p
+    interval: 0
+    url: "http://x6.846803.xyz:39401/sub-store-api/download/%E5%9B%BD%E5%A4%96"
+  快跑钉钉:
+    path: ./proxies/快跑钉钉.yaml
+    <<: *ppp
+    url: "http://x6.846803.xyz:39401/sub-store-api/download/%E5%9B%BD%E9%99%85"
+  家宽:
+    path: ./proxies/家宽.yaml
+    <<: *ppp
+    url: "http://x6.846803.xyz:39401/sub-store-api/download/%E5%9B%BD%E5%86%85%E5%85%8D%E6%B5%81"
+
+  CF鸡:
+    path: ./proxies/CF.yaml
+    <<: *p
+    url: "https://edt2.cinz.dpdns.org/sub?token=33a233c77c8620650c9fc0f111a40e3b"
+  赔钱鸡:
+    path: ./proxies/赔钱吉利.yaml
+    <<: *p
+    url: "https://dasho.pqjc.site/api/v1/pq/8d8d0bd56fdf4ece54b986f665cfc3a5"
+    interval: 0
+  # ================================================================
+  # 【新增】Emby 链式专用订阅池
+  #
+  # 就是把 Emby代理 用的那几条订阅再各拉一份，唯一区别是 override 里写了
+  #   dialer-proxy: 国内免流
+  # 这一批节点因此全部不再直连，改从「国内免流」当前选中的那个节点拨出去。
+  # 链路：手机 →「国内免流」节点（国内中转，走免流入口）→ 这里的节点 → Emby
+  #
+  # 面板上切「国内免流」组 = 换中转机，链式出口跟着变，不用改配置。
+  # additional-prefix 给节点名加 [链] 前缀，跟原来那批同名节点区分开。
+  # path 必须和原订阅不同文件，否则两个 provider 抢同一个缓存文件。
+  #
+  # health-check 会带着 dialer-proxy 一起测，所以面板上显示的延迟就是
+  # 「国内免流 → 落地」的真实链路延迟。如果整池全超时，先看「国内免流」
+  # 选中的节点本身通不通 —— 前置挂了，后面全挂。
+  # ================================================================
+  Emby链-快乐鸡:
+    path: ./proxies/Emby链-快乐鸡.yaml
+    <<: *p
+    interval: 0
+    url: "http://x6.846803.xyz:39401/sub-store-api/download/%E6%96%B0"
+    override:
+      dialer-proxy: 国内免流
+      additional-prefix: "[链]"
+  Emby链-赔钱鸡:
+    path: ./proxies/Emby链-CF.yaml
+    <<: *p
+    interval: 0
+    url: "https://dasho.pqjc.site/api/v1/pq/8d8d0bd56fdf4ece54b986f665cfc3a5"
+    override:
+      dialer-proxy: 国内免流
+      additional-prefix: "[链]"
+  # 想让 快跑钉钉 也进链式池，取消下面这段注释，并在 Emby链式 分组的 use 里加上它
+  # Emby链-快跑钉钉:
+  #   path: ./proxies/Emby链-快跑钉钉.yaml
+  #   <<: *ppp
+  #   url: "http://x6.846803.xyz:39401/sub-store-api/download/%E5%9B%BD%E9%99%85"
+  #   override:
+  #     dialer-proxy: 国内免流
+  #     additional-prefix: "[链]"
+
+  # 以下订阅当前未在分组中使用，需要时再启用
+  # 阿尔法:
+    # path: ./proxies/阿尔法.yaml
+    # <<: *p
+    # url: "http://192.168.5.1:39401/23dF89gH67jK12LmN45Pq/download/%E9%98%BF%E5%B0%94%E6%B3%95"
+  # 赔钱:
+    # path: ./proxies/赔钱.yaml
+    # <<: *p
+    # url: "http://192.168.5.1:39401/23dF89gH67jK12LmN45Pq/download/%E8%B5%94%E9%92%B1"
+  # 两狗子:
+    # path: ./proxies/两狗子.yaml
+    # <<: *p
+    # url: "https://hhsxy.vavava.kdns.fr/sub?token=25e95d1f8f790ad3e5359c501d5fc7ee"
+
+# ==================== 代理 ====================
+proxies:
+  - name: "直连"
+    type: direct
+    udp: true
+  - name: "DNS_Hijack"
+    type: dns
+  - name: "广州移动"
+    type: http
+    server: 14.215.182.75
+    port: 443
+    headers:
+      Proxy-Connection: keep-alive
+      X-T5-Auth: 683556433
+      Host: 153.3.236.22:443
+      With-At: gw.alicdn.com
+      ConPath: "gw.alicdn.com"
+      User-Agent: "okhttp/3.11.0 Dalvik/2.1.0 (Linux; U; Android 15; Build/RP1A.210720.011) baiduboxapp/14.10.0.10 (Baidu; P1 12)"
+
+# ==================== 代理组 ====================
+proxy-groups:
+  - name: 国外出口
+    type: select
+    proxies:
+      - 国外非免流
+      - 国外免流
+  - name: 国内出口
+    type: select
+    proxies:
+      - 直连
+      - 国内免流
+  - name: 国内免流
+    type: select
+    use:
+      - 快跑钉钉
+      - 家宽
+    filter: "(?i)CN|xin|广西|广州|阿里"
+    url: http://connect.rom.miui.com/generate_204
+  - name: 国外免流
+    type: select
+    use:
+      - 国外免
+      - 快跑钉钉
+    filter: "(?=.*(?:免流|xin|ML|ml|Ml|链式|🇸🇬|sg|SG|香港|新加坡|台湾|日本|美国|德国|优选|jp|韩国))"
+    url: http://www.google.com/generate_204
+  - name: 国外非免流
+    type: select
+    use:
+      - 快乐鸡
+      - CF鸡
+      - 快跑钉钉
+      - 赔钱鸡
+    filter: *filter2
+  - name: Emby节点
+    type: select
+    proxies:
+      - Emby非免流
+      - Emby免流
+  - name: Emby非免流
+    type: select
+    use:
+      - 快乐鸡
+      - 快跑钉钉
+      - 赔钱鸡
+    filter: *filterEmby
+  - name: Emby免流
+    type: select
+    # 【新增】proxies 和 use 可以并存：链式出口排在最前面，后面接原来那批免流节点
+    # 需要国内中转就在面板上选 Emby链式，不需要就照旧选具体免流节点，行为完全不变
+    proxies:
+      - Emby链式
+    use:
+      - 国外免
+      - 快跑钉钉
+    filter: "(?i)Emby|德国|DE|de|新加坡|SG|🇸🇬|韩国|🇰🇷|印度|🇮🇳|sg|法国|🇫🇷|瑞士|US|芬兰|英国|泰国|加拿大|荷兰|美国|us|台湾|tw|xin"
+  # 【新增】链式落地池：节点来自带 dialer-proxy 的 Emby链-* 订阅
+  # 前置 = 国内免流（在那一组里切节点即可换中转），落地 = 这里选的节点
+  - name: Emby链式
+    type: select
+    use:
+      - Emby链-快乐鸡
+      - Emby链-赔钱鸡
+      # - Emby链-快跑钉钉
+    filter: "(?i)Emby|德国|DE|de|新加坡|SG|🇸🇬|韩国|🇰🇷|印度|🇮🇳|sg|法国|🇫🇷|瑞士|US|芬兰|英国|泰国|加拿大|荷兰|美国|us|台湾|tw"
+    url: http://www.google.com/generate_204
+  - name: AI节点
+    type: select
+    proxies:
+      - AI非免流
+      - AI免流
+  - name: AI免流
+    type: select
+    proxies:
+      - Emby链式
+    use:
+      - 国外免
+      - 快跑钉钉
+    filter: "(?=.*(?:免流|xin|ML|ml|Ml|链式|🇸🇬|sg|SG|香港|台湾|美国|德国|US))"
+    url: "https://connectivitycheck.platform.hicloud.com/generate_204"
+  - name: AI非免流
+    type: select
+    use:
+      - 快乐鸡
+      - CF鸡
+      - 快跑钉钉
+      - 赔钱鸡
+    filter: "(?=.*(?:免流|xin|ML|ml|Ml|链式|🇸🇬|sg|SG|香港|台湾|美国|德国|日本|新加坡|YM|🇺🇸|DE|🇩🇪|印度|韩国|🇰🇷|台湾))"
+  - name: UDP游戏
+    type: select
+    proxies:
+      - 直连
+      - 游戏
+  - name: 游戏
+    type: select
+    use:
+      - 快跑钉钉
+      - 家宽
+    filter: "(?i)上海|浙江|GBP|xin"
+  - name: 全部节点
+    type: select
+    # 【改动】原来是 include-all-providers: true，那会把新增的 Emby链-* 池子
+    # 也整份塞进来（同一批节点带 [链] 前缀再出现一遍，列表直接翻倍）。
+    # 改成显式列出 5 条原始订阅。想让链式节点也出现在这里，取消末尾两行注释。
+    use:
+      - 快乐鸡
+      - 国外免
+      - 快跑钉钉
+      - 家宽
+      - CF鸡
+      # - Emby链-快乐鸡
+      # - Emby链-赔钱鸡
+
+# ==================== 规则 ====================
+rules:
+  - PROCESS-NAME,com.hush.yamby,Emby节点
+  - PROCESS-NAME,org.nobody.multitts,国内出口
+  - PROCESS-NAME,com.openminis.app,AI节点
+  - PROCESS-NAME,com.ai.assistance.operit,AI节点
+  - PROCESS-NAME,me.rerere.rikkahub,AI节点
+  - IP-CIDR,209.141.61.153/32,Emby节点
+  - DST-PORT,53,DNS_Hijack
+  - AND,((NETWORK,UDP),(DST-PORT,3478)),REJECT
+  # 【优化】GEOIP 会强制加载整份 geoip 数据库（占十几~二十几 MB 内存）；改用已有 private_ip 规则集(也是 mrs 格式)，效果完全相同
+  - AND,((NETWORK,UDP),(RULE-SET,private_ip,no-resolve)),REJECT
+  - AND,((NETWORK,UDP),(DST-PORT,123)),DIRECT
+  - AND,((NETWORK,UDP),(DST-PORT,8090)),DIRECT
+  - AND,((NETWORK,UDP),(PROCESS-NAME,com.tencent.tmgp.sgame)),DIRECT
+  - AND,((NETWORK,UDP),(PROCESS-NAME,com.miHoYo.Yuanshen)),游戏
+#  - RULE-SET,Emby2,Emby节点
+  - DOMAIN,ai.lfree.org,AI节点
+  # - DOMAIN-SUFFIX,jmsuper.com,Emby节点
+  # '- DOMAIN-SUFFIX,cflocal.xxlb.net,Emby节点
+  # - DOMAIN-SUFFIX,emby.191920.xyz,Emby节点
+  # - DOMAIN-SUFFIX,hka-emby.aliz.work,Emby节点
+  # - DOMAIN-SUFFIX,gyplay.xxlb.net,Emby节点
+  # - DOMAIN-SUFFIX,emby2.029902.xyz,Emby节点
+  # 注意：这两条也指向 Emby免流，所以你在 Emby免流 里选中 Emby链式 后，
+  # nodeseek/leaflow 也会跟着走「国内中转 → 境外落地」。不想让它们走链式的话，
+  # 把这两条改成指向 国外免流 或新建一个组。
+  - DOMAIN-SUFFIX,nodeseek.com,Emby免流
+  - DOMAIN-SUFFIX,leaflow.net,Emby免流
+  - DOMAIN-SUFFIX,claude.com,国外出口
+  - DOMAIN,mcdn.bilivideo.cn,国内出口
+  - DOMAIN,tracker.biliapi.net,国内出口
+  - DOMAIN-SUFFIX,chat.bilibili.com,国内出口
+  - DOMAIN-SUFFIX,szbdyd.com,国内出口
+  - DOMAIN-SUFFIX,yaohuo.me,国内出口
+  # - DOMAIN-SUFFIX,speech.platform.bing.com,国内出口
+  # - DOMAIN-SUFFIX,api-edge.cognitive.microsofttranslator.com,国内出口
+  # - DOMAIN-SUFFIX,eastasia.tts.speech.microsoft.com,国内出口
+  # - DOMAIN-SUFFIX,southeastasia.tts.speech.microsoft.com,国内出口
+  # - DOMAIN-SUFFIX,dev.microsofttranslator.com,国内出口
+  - RULE-SET,private_ip,DIRECT,no-resolve
+  - RULE-SET,AI,AI节点
+  - RULE-SET,bilibili_domain,国内出口
+  - RULE-SET,cn_domain,国内出口
+  - RULE-SET,cn_ip,国内出口
+  - MATCH,国外出口
+
+# ==================== 规则锚点和提供者 ====================
+rule-anchor:
+  ip: &ip {type: http, interval: 0, behavior: ipcidr, format: mrs}
+  domain: &domain {type: http, interval: 0, behavior: domain, format: mrs}
+  BehaviorDN: &BehaviorDN {type: http, behavior: domain, format: mrs, interval: 0}
+  BehaviorIP: &BehaviorIP {type: http, behavior: ipcidr, format: mrs, interval: 0}
+
+rule-providers:
+  private_domain:
+    <<: *domain
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/private.mrs"
+  cn_domain:
+    <<: *domain
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/cn.mrs"
+  bilibili_domain:
+    <<: *domain
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/bilibili.mrs"
+  private_ip:
+    <<: *ip
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/private.mrs"
+  cn_ip:
+    <<: *ip
+    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/cn.mrs"
+  AI:
+    {<<: *BehaviorDN, url: https://raw.githubusercontent.com/DustinWin/ruleset_geodata/refs/heads/mihomo-ruleset/ai.mrs}
+  # 【优化】规则已被注释，Emby2 订阅不再被使用，删掉免得每次启动都下载并占用内存
+  # Emby2:
+  #   {<<: *BehaviorDN, url: https://git.imee.me/https://github.com/666OS/rules/raw/release/mihomo/domain/Emby.mrs}
+  Fake-IP-Filter:
+    <<: *domain
+    path: ./rule_provider/Fake-IP-Filter.mrs
+    url: "https://github.com/DustinWin/ruleset_geodata/raw/refs/heads/mihomo-ruleset/fakeip-filter.mrs"
