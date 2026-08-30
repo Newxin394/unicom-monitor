@@ -1,5 +1,5 @@
 # 联通余量查询与跳点监控 (ChinaUnicom Quota & Traffic Jump Monitor)
-
+纯AI 无手写有问题，不会修
 > 🚀 **轻量、极速、无混淆、支持三色跳点精准预警、双独立通道冷却与全平台推送的中国联通余量监控**。完美兼容 **呆呆面板 (Dumb-Panel)**、**青龙面板 (QingLong)** 以及 **OpenWrt 路由器** 裸机运行。
 
 ---
