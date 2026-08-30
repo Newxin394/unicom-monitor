@@ -1,5 +1,38 @@
+# Node & Runtime Logs
 node_modules/
-10010v4_cookie.txt
-10010v4_data.json
-.DS_Store
 *.log
+*.tmp
+*.bak
+
+# Runtime Stores & Locks
+10010v4_cookie.txt
+10010v4_data.json*
+10010v4x_data.json*
+10010v4x_store.lock
+10010v4x_tg_bot.pid
+
+# Workspace Specific / Non-Repo Files
+sing-box*
+wifi*
+config*
+shortx*
+ebpf*
+*.zip
+*.yaml
+*.txt
+*.cmd
+*.srs
+gen_auto_switch.js
+patch_ebpf_bypass.js
+validate_prep.js
+mkzip.js
+1/
+ARCHIVE.md
+GEMINI.md
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+auto_wifi_watch.sh
+*.json*
