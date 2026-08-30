@@ -1,8 +1,16 @@
 #!/bin/sh
 # 自动加载 config.sh 环境变量 (兼容呆呆面板与青龙面板)
+CR=$(printf '\r')
 for f in /app/Dumb-Panel/config.sh /app/Dumb-Panel/config/config.sh /docker/daidai/Dumb-Panel/config.sh /ql/data/config/config.sh ./config.sh ../config.sh; do
     if [ -f "$f" ]; then
-        . "$f"
+        # 1. 尝试就地清理文件中的 \r (CRLF -> LF)
+        sed -i "s/${CR}\$//" "$f" 2>/dev/null || true
+        # 2. 安全加载配置（若仍含 \r 则使用去除后的流加载）
+        if grep "${CR}" "$f" >/dev/null 2>&1; then
+            eval "$(tr -d '\r' < "$f")" 2>/dev/null || . "$f"
+        else
+            . "$f"
+        fi
     fi
 done
 
