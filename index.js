@@ -128,8 +128,8 @@ async function processAccount(cookie, index = 0) {
     });
 
     const data = response.data;
-    if (!data || data.code !== '0000') {
-        console.error(`❌ [账号 ${index + 1}] 接口返回异常:`, JSON.stringify(data));
+    if (!data || data.code !== '0000' || !Array.isArray(data.resources) || data.resources.length === 0) {
+        console.error(`❌ [账号 ${index + 1}] 接口返回异常或无资源数据:`, JSON.stringify(data));
         return;
     }
 
@@ -218,18 +218,48 @@ async function processAccount(cookie, index = 0) {
     const todayNormalLimit = Math.max(0, buckets.normalLimited.used - (store.today.normalLimitedUsed || 0));
     const todayNormal = Math.max(0, normalUsed - (store.today.normalUsed || 0));
 
+    store.history = store.history || [];
+    const shouldAppend = store.history.length === 0 || (now.getTime() - store.history[store.history.length - 1].time) >= 20000;
+    if (shouldAppend) {
+        store.history.push({ time: now.getTime(), ...currentSnapshot });
+    }
+    const oneDayAgo = now.getTime() - 24 * 3600 * 1000;
+    store.history = store.history.filter(h => h.time >= oneDayAgo);
+
     let durationStr = '0秒';
     let diffFreeUnlimit = 0, diffFreeLimit = 0, diffFree = 0;
     let diffNormalLimit = 0, diffNormal = 0;
 
-    if (store.last && store.last.time) {
-        const sec = (now.getTime() - store.last.time) / 1000;
+    let baseSnap = null;
+    let baseTime = 0;
+
+    const botMinutes = parseInt(process.env.ChinaUnicom_10010v4_bot_minutes || '30', 10);
+    if (botMinutes > 0 && store.history.length > 0) {
+        const targetTs = now.getTime() - botMinutes * 60 * 1000;
+        let minDiff = Infinity;
+        for (const h of store.history) {
+            const d = Math.abs(h.time - targetTs);
+            if (d < minDiff) {
+                minDiff = d;
+                baseSnap = h;
+                baseTime = h.time;
+            }
+        }
+    }
+
+    if (!baseSnap && store.last && store.last.time) {
+        baseSnap = store.last;
+        baseTime = store.last.time;
+    }
+
+    if (baseSnap && baseTime) {
+        const sec = (now.getTime() - baseTime) / 1000;
         durationStr = formatDuration(sec);
-        diffFreeUnlimit = Math.max(0, buckets.freeUnlimited.used - (store.last.freeUnlimitedUsed || 0));
-        diffFreeLimit = Math.max(0, buckets.freeLimited.used - (store.last.freeLimitedUsed || 0));
-        diffFree = Math.max(0, freeUsed - (store.last.freeUsed || 0));
-        diffNormalLimit = Math.max(0, buckets.normalLimited.used - (store.last.normalLimitedUsed || 0));
-        diffNormal = Math.max(0, normalUsed - (store.last.normalUsed || 0));
+        diffFreeUnlimit = Math.max(0, buckets.freeUnlimited.used - (baseSnap.freeUnlimitedUsed || 0));
+        diffFreeLimit = Math.max(0, buckets.freeLimited.used - (baseSnap.freeLimitedUsed || 0));
+        diffFree = Math.max(0, freeUsed - (baseSnap.freeUsed || 0));
+        diffNormalLimit = Math.max(0, buckets.normalLimited.used - (baseSnap.normalLimitedUsed || 0));
+        diffNormal = Math.max(0, normalUsed - (baseSnap.normalUsed || 0));
     }
 
     store.last = { time: now.getTime(), ...currentSnapshot };
@@ -286,7 +316,7 @@ async function processAccount(cookie, index = 0) {
 
     const defaultTitleTpl = '[套餐]';
     const defaultSubtTpl = '[时长] 跳 [所有通用.用量] 免 [所有免流.用量]';
-    const defaultDescTpl = `☸️通用总共 [通用有限.总] 🔯\n☯️通用已用 [通用有限.已用]🕎\n🕉通用剩余 [通用有限.剩余] ☪️\n♒️免流已用 [免流不限.已用] ⛎\n🕉今日通用 [所有通用.今日用量] 🕉\n🕉今日免流 [所有免流.今日用量] 🕉\n♈️联通时间 [联通时间]♌️`;
+    const defaultDescTpl = `☸️通用总共 [通用有限.总] 🔯\n☯️通用已用 [通用有限.已用]🕎\n🕉通用剩余 [通用有限.剩余] ☪️\n♒️免流已用 [所有免流.已用] ⛎\n🕉今日通用 [所有通用.今日用量] 🕉\n🕉今日免流 [所有免流.今日用量] 🕉\n♈️联通时间 [联通时间]♌️`;
 
     const titleTpl = process.env.ChinaUnicom_10010v4_title || defaultTitleTpl;
     const subtTpl = process.env.ChinaUnicom_10010v4_subt || defaultSubtTpl;

@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -50,11 +51,17 @@ type UsageSnapshot struct {
 	NormalUsed        float64 `json:"normalUsed"`
 }
 
+type SnapshotRecord struct {
+	Timestamp int64          `json:"timestamp"`
+	Snapshot  *UsageSnapshot `json:"snapshot"`
+}
+
 type AccountStore struct {
-	Last      *UsageSnapshot `json:"last,omitempty"`
-	LastTime  int64          `json:"lastTime,omitempty"`
-	Today     *UsageSnapshot `json:"today,omitempty"`
-	TodayDate int64          `json:"todayDate,omitempty"`
+	Last      *UsageSnapshot   `json:"last,omitempty"`
+	LastTime  int64            `json:"lastTime,omitempty"`
+	Today     *UsageSnapshot   `json:"today,omitempty"`
+	TodayDate int64            `json:"todayDate,omitempty"`
+	History   []SnapshotRecord `json:"history,omitempty"`
 
 	// 旧字段，仅用于从单阈值版本升级时迁移，之后不再参与判定
 	LastAlertTime int64 `json:"lastAlertTime"`
@@ -103,6 +110,7 @@ var (
 	minNormUsage float64 // 通用流量跳点阈值，默认 50M
 	minFreeUsage float64 // 免流流量跳点阈值，默认 400M
 
+	botDiffMinutes    int           // 机器人主动查询默认对比时长（分钟），默认 0（对比上次自动巡检）
 	alertBypassMb     float64       // 通用跳点超此值时无视冷却
 	alertCooldown     time.Duration // 通用跳点冷却
 	freeAlertCooldown time.Duration // 免流跳点冷却
@@ -178,6 +186,13 @@ func init() {
 		minFreeUsage = 2000
 	}
 
+	// 机器人默认独立对比时长（分钟），默认 30 分钟
+	bMin, _ := strconv.Atoi(getEnv("ChinaUnicom_10010v4_bot_minutes", "30"))
+	if bMin <= 0 {
+		bMin = 30
+	}
+	botDiffMinutes = bMin
+
 	// 越级放行只看通用跳点，避免免流不限量把这条通道常年顶开
 	alertBypassMb, _ = strconv.ParseFloat(getEnv("ALERT_BYPASS_MB", "0"), 64)
 	if alertBypassMb < 0 {
@@ -212,6 +227,13 @@ func init() {
 }
 
 // ======================== 通用工具函数 ========================
+
+func absInt64(n int64) int64 {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
 
 var configShCache map[string]string
 
@@ -419,7 +441,10 @@ func loadStoreSafe() *StoreData {
 	storeMainHealthy.Store(true)
 
 	if raw, err := os.ReadFile(dataFile); err == nil {
-		if json.Unmarshal(raw, store) == nil && store.Accounts != nil {
+		if json.Unmarshal(raw, store) == nil {
+			if store.Accounts == nil {
+				store.Accounts = make(map[string]*AccountStore)
+			}
 			return store
 		}
 	}
@@ -427,8 +452,12 @@ func loadStoreSafe() *StoreData {
 	storeMainHealthy.Store(false)
 	fmt.Println("⚠️ [存储] 主数据损坏，尝试用 .bak 恢复...")
 
+	store = &StoreData{Accounts: make(map[string]*AccountStore)}
 	if bakRaw, err := os.ReadFile(bakFile); err == nil {
-		if json.Unmarshal(bakRaw, store) == nil && store.Accounts != nil {
+		if json.Unmarshal(bakRaw, store) == nil {
+			if store.Accounts == nil {
+				store.Accounts = make(map[string]*AccountStore)
+			}
 			fmt.Println("✅ [存储] 已从 .bak 找回基线数据")
 			return store
 		}
@@ -592,7 +621,7 @@ func notifyFault(reason string) {
 
 // ======================== 核心数据查询与计算 ========================
 
-func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool) (*QueryResult, error) {
+func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, diffMinutes int) (*QueryResult, error) {
 	apiURL := "https://m.client.10010.com/servicequerybusiness/operationservice/queryOcsPackageFlowLeftContentRevisedInJune"
 
 	req, err := http.NewRequest("POST", apiURL, nil)
@@ -645,6 +674,10 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool) (*Q
 		return nil, fmt.Errorf("%s", msg)
 	}
 
+	if len(data.Resources) == 0 {
+		return nil, fmt.Errorf("联通接口返回空资源列表 (无套餐数据)")
+	}
+
 	var freeUnlimitUsed, freeLimitUsed, freeLimitTotal, freeLimitRemain float64
 	var normUnlimitUsed, normLimitUsed, normLimitTotal, normLimitRemain float64
 	var voiceTotal, voiceUsed, voiceRemain float64
@@ -657,9 +690,18 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool) (*Q
 				u := toFloat(item.Use)
 				rem := toFloat(item.Remain)
 				isUnlimit := toFloat(item.Limited) == 1 || tot <= 0
+
+				// 兜底：若接口未返回 remain 且非无限量，由 total - use 计算
+				if rem <= 0 && tot > u && !isUnlimit {
+					rem = tot - u
+				}
+
+				// 深度免流特征识别（兼容畅视、直播、专享免费、专属流量等特定省份命名）
 				isFree := item.FlowType == "2" || item.FlowType == "3" ||
 					res.Type == "MlFlowdetailsList" ||
-					strings.Contains(name, "免流") || strings.Contains(name, "定向")
+					strings.Contains(name, "免流") || strings.Contains(name, "定向") ||
+					strings.Contains(name, "直播") || strings.Contains(name, "畅视") ||
+					strings.Contains(name, "专享免费") || strings.Contains(name, "专属流量")
 
 				if isFree {
 					if isUnlimit {
@@ -682,9 +724,15 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool) (*Q
 		}
 		if res.Type == "Voice" {
 			for _, item := range res.Details {
-				voiceTotal += toFloat(item.Total)
-				voiceUsed += toFloat(item.Use)
-				voiceRemain += toFloat(item.Remain)
+				tot := toFloat(item.Total)
+				u := toFloat(item.Use)
+				rem := toFloat(item.Remain)
+				if rem <= 0 && tot > u {
+					rem = tot - u
+				}
+				voiceTotal += tot
+				voiceUsed += u
+				voiceRemain += rem
 			}
 		}
 	}
@@ -713,63 +761,203 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool) (*Q
 	var diffNorm, diffNormLimit, diffFree, diffFreeUnlimit, diffFreeLimit float64
 	var todayNorm, todayNormLimit, todayFree, todayFreeUnlimit, todayFreeLimit float64
 
-	_, lockErr := lockAndModifyStore(func(store *StoreData) bool {
-		acc, ok := store.Accounts[accKey]
-		if !ok {
-			acc = &AccountStore{}
-			store.Accounts[accKey] = acc
-		}
+	if updateBaseline {
+		// ================= 守卫 3 & 4: 快照与基线只在监控周期写入 (单层锁保护) =================
+		_, lockErr := lockAndModifyStore(func(store *StoreData) bool {
+			acc, ok := store.Accounts[accKey]
+			if !ok {
+				acc = &AccountStore{}
+				store.Accounts[accKey] = acc
+			}
 
-		// 【防抖保护】：非 1 号且之前已有正常用量，但接口突发归零，视为网关故障脏数据，拒绝刷乱基线
-		if now.Day() != 1 && acc.Last != nil && acc.Last.NormalUsed > 10 && normUsed == 0 {
-			fmt.Println("⚠️ [防抖保护] 接口用量突发归零（疑似网关维护），本次放弃覆盖基线。")
-			return false
-		}
+			// 【防抖保护】：非 1 号且之前已有正常用量，但接口突发归零，视为网关故障脏数据，拒绝刷乱基线
+			if now.Day() != 1 && acc.Last != nil && acc.Last.NormalUsed > 10 && normUsed == 0 {
+				fmt.Println("⚠️ [防抖保护] 接口用量突发归零（疑似网关维护），本次放弃覆盖基线。")
+				return false
+			}
 
-		var dirty bool
+			// 守卫 5: ts 严格递增去重写入历史轨迹
+			nowMs := now.UnixMilli()
+			if len(acc.History) > 0 {
+				lastTs := acc.History[len(acc.History)-1].Timestamp
+				if nowMs <= lastTs {
+					nowMs = lastTs + 1
+				}
+			}
+			acc.History = append(acc.History, SnapshotRecord{
+				Timestamp: nowMs,
+				Snapshot:  currentSnap,
+			})
 
-		// 今日基线处理
-		if acc.Today == nil || acc.TodayDate != todayZero || normUsed < acc.Today.NormalUsed {
-			if updateBaseline || acc.Today == nil || acc.TodayDate != todayZero {
+			// 守卫 5: trim 只删超过 24 小时的最老记录
+			oneDayAgo := now.Add(-24 * time.Hour).UnixMilli()
+			if len(acc.History) > 0 && acc.History[0].Timestamp < oneDayAgo {
+				validIdx := 0
+				for i, h := range acc.History {
+					if h.Timestamp >= oneDayAgo {
+						validIdx = i
+						break
+					}
+				}
+				if validIdx > 0 {
+					acc.History = acc.History[validIdx:]
+				}
+			}
+
+			// 今日基线处理
+			if acc.Today == nil || acc.TodayDate != todayZero || normUsed < acc.Today.NormalUsed {
 				acc.Today = currentSnap
 				acc.TodayDate = todayZero
-				dirty = true
+			}
+
+			todayNorm = normUsed - acc.Today.NormalUsed
+			todayNormLimit = normLimitUsed - acc.Today.NormalLimitedUsed
+			todayFree = freeUsed - acc.Today.FreeUsed
+			todayFreeUnlimit = freeUnlimitUsed - acc.Today.FreeUnlimitedUsed
+			todayFreeLimit = freeLimitUsed - acc.Today.FreeLimitedUsed
+
+			if todayNorm < 0 {
+				todayNorm = 0
+			}
+			if todayNormLimit < 0 {
+				todayNormLimit = 0
+			}
+			if todayFree < 0 {
+				todayFree = 0
+			}
+			if todayFreeUnlimit < 0 {
+				todayFreeUnlimit = 0
+			}
+			if todayFreeLimit < 0 {
+				todayFreeLimit = 0
+			}
+
+			if acc.Last != nil && acc.LastTime > 0 {
+				elapsed := now.Sub(time.UnixMilli(acc.LastTime))
+				durationStr = formatDuration(elapsed)
+
+				if normUsed >= acc.Last.NormalUsed {
+					diffNorm = normUsed - acc.Last.NormalUsed
+					diffNormLimit = normLimitUsed - acc.Last.NormalLimitedUsed
+				}
+				if freeUsed >= acc.Last.FreeUsed {
+					diffFree = freeUsed - acc.Last.FreeUsed
+					diffFreeUnlimit = freeUnlimitUsed - acc.Last.FreeUnlimitedUsed
+					diffFreeLimit = freeLimitUsed - acc.Last.FreeLimitedUsed
+				}
+			}
+
+			if diffNorm < 0 {
+				diffNorm = 0
+			}
+			if diffNormLimit < 0 {
+				diffNormLimit = 0
+			}
+			if diffFree < 0 {
+				diffFree = 0
+			}
+			if diffFreeUnlimit < 0 {
+				diffFreeUnlimit = 0
+			}
+			if diffFreeLimit < 0 {
+				diffFreeLimit = 0
+			}
+
+			acc.Last = currentSnap
+			acc.LastTime = now.UnixMilli()
+			return true
+		})
+
+		if lockErr != nil {
+			fmt.Printf("⚠️ [存储] 本次基线写入失败 (%v)，跳点数据不可信\n", lockErr)
+		}
+	} else {
+		// ================= 守卫 2 & 3: 主动查询只读 loadStoreSafe，不写快照、不改基线与冷却 =================
+		store := loadStoreSafe()
+		acc, ok := store.Accounts[accKey]
+		if !ok || acc == nil {
+			acc = &AccountStore{}
+		}
+
+		if acc.Today != nil && acc.TodayDate == todayZero {
+			todayNorm = normUsed - acc.Today.NormalUsed
+			todayNormLimit = normLimitUsed - acc.Today.NormalLimitedUsed
+			todayFree = freeUsed - acc.Today.FreeUsed
+			todayFreeUnlimit = freeUnlimitUsed - acc.Today.FreeUnlimitedUsed
+			todayFreeLimit = freeLimitUsed - acc.Today.FreeLimitedUsed
+
+			if todayNorm < 0 {
+				todayNorm = 0
+			}
+			if todayNormLimit < 0 {
+				todayNormLimit = 0
+			}
+			if todayFree < 0 {
+				todayFree = 0
+			}
+			if todayFreeUnlimit < 0 {
+				todayFreeUnlimit = 0
+			}
+			if todayFreeLimit < 0 {
+				todayFreeLimit = 0
 			}
 		}
 
-		todayNorm = normUsed - acc.Today.NormalUsed
-		todayNormLimit = normLimitUsed - acc.Today.NormalLimitedUsed
-		todayFree = freeUsed - acc.Today.FreeUsed
-		todayFreeUnlimit = freeUnlimitUsed - acc.Today.FreeUnlimitedUsed
-		todayFreeLimit = freeLimitUsed - acc.Today.FreeLimitedUsed
-
-		if todayNorm < 0 {
-			todayNorm = 0
+		effectiveMinutes := diffMinutes
+		if effectiveMinutes == 0 && botDiffMinutes > 0 {
+			effectiveMinutes = botDiffMinutes
 		}
-		if todayNormLimit < 0 {
-			todayNormLimit = 0
-		}
-		if todayFree < 0 {
-			todayFree = 0
-		}
-		if todayFreeUnlimit < 0 {
-			todayFreeUnlimit = 0
-		}
-		if todayFreeLimit < 0 {
-			todayFreeLimit = 0
+		if effectiveMinutes < 0 {
+			effectiveMinutes = 0
 		}
 
-		if acc.Last != nil && acc.LastTime > 0 {
-			durationStr = formatDuration(now.Sub(time.UnixMilli(acc.LastTime)))
+		var baseSnap *UsageSnapshot
+		var baseTime int64
+		var isHistoryMatch bool
 
-			if normUsed >= acc.Last.NormalUsed {
-				diffNorm = normUsed - acc.Last.NormalUsed
-				diffNormLimit = normLimitUsed - acc.Last.NormalLimitedUsed
+		// 守卫 5: 回溯取 <= 目标时间最大一条 (Floor 查找)，时间序永远单调一致
+		if effectiveMinutes > 0 && len(acc.History) > 0 {
+			targetTs := now.UnixMilli() - int64(effectiveMinutes)*60*1000
+			var bestRecord *SnapshotRecord
+
+			for i := len(acc.History) - 1; i >= 0; i-- {
+				if acc.History[i].Timestamp <= targetTs {
+					bestRecord = &acc.History[i]
+					break
+				}
 			}
-			if freeUsed >= acc.Last.FreeUsed {
-				diffFree = freeUsed - acc.Last.FreeUsed
-				diffFreeUnlimit = freeUnlimitUsed - acc.Last.FreeUnlimitedUsed
-				diffFreeLimit = freeLimitUsed - acc.Last.FreeLimitedUsed
+			if bestRecord == nil {
+				bestRecord = &acc.History[0]
+			}
+
+			if bestRecord != nil && bestRecord.Snapshot != nil {
+				baseSnap = bestRecord.Snapshot
+				baseTime = bestRecord.Timestamp
+				isHistoryMatch = true
+			}
+		}
+
+		if baseSnap == nil && acc.Last != nil && acc.LastTime > 0 {
+			baseSnap = acc.Last
+			baseTime = acc.LastTime
+		}
+
+		if baseSnap != nil && baseTime > 0 {
+			elapsed := now.Sub(time.UnixMilli(baseTime))
+			if isHistoryMatch {
+				durationStr = fmt.Sprintf("对比 %d分钟前 (基线 %s)", effectiveMinutes, time.UnixMilli(baseTime).In(cst).Format("15:04:05"))
+			} else {
+				durationStr = formatDuration(elapsed)
+			}
+
+			if normUsed >= baseSnap.NormalUsed {
+				diffNorm = normUsed - baseSnap.NormalUsed
+				diffNormLimit = normLimitUsed - baseSnap.NormalLimitedUsed
+			}
+			if freeUsed >= baseSnap.FreeUsed {
+				diffFree = freeUsed - baseSnap.FreeUsed
+				diffFreeUnlimit = freeUnlimitUsed - baseSnap.FreeUnlimitedUsed
+				diffFreeLimit = freeLimitUsed - baseSnap.FreeLimitedUsed
 			}
 		}
 
@@ -788,17 +976,6 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool) (*Q
 		if diffFreeLimit < 0 {
 			diffFreeLimit = 0
 		}
-
-		if updateBaseline {
-			acc.Last = currentSnap
-			acc.LastTime = now.UnixMilli()
-			dirty = true
-		}
-		return dirty
-	})
-
-	if lockErr != nil {
-		fmt.Printf("⚠️ [存储] 本次基线读写失败 (%v)，跳点数据不可信\n", lockErr)
 	}
 
 	totalDiff := diffNorm + diffFree
@@ -867,7 +1044,7 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool) (*Q
 	escapedVars["[套餐]"] = html.EscapeString(pkgName)
 	escapedVars["[联通时间]"] = html.EscapeString(data.Time)
 
-	defaultBotTitle := "⚡ <b>联通实时跳点播报</b>"
+	var defaultBotTitle string
 	defaultBotDesc := "━━━━━━━━━━━━━━━━━━\n" +
 		"📦 套餐：<b>[套餐]</b>\n" +
 		"⏱ 距上次：<b>[时长]</b> ([时间])\n" +
@@ -885,6 +1062,30 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool) (*Q
 		"• 免流已用：[所有免流.已用]\n" +
 		"• 语音剩余：[语音.剩余]\n" +
 		"<i>联通时间: [联通时间]</i>"
+
+	if diffMinutes == -1 {
+		defaultBotTitle = "📦 <b>联通套餐总余量概览</b>"
+		defaultBotDesc = "━━━━━━━━━━━━━━━━━━\n" +
+			"📦 套餐：<b>[套餐]</b>\n" +
+			"━━━━━━━━━━━━━━━━━━\n" +
+			"📊 <b>当前余量概览：</b>\n" +
+			"• 通用剩余：[所有通用.剩余] (共 [所有通用.总])\n" +
+			"• 免流已用：[所有免流.已用]\n" +
+			"• 语音剩余：[语音.剩余]\n" +
+			"━━━━━━━━━━━━━━━━━━\n" +
+			"📅 <b>今日累计消耗：</b>\n" +
+			"• 今日通用：[所有通用.今日用量]\n" +
+			"• 今日免流：[所有免流.今日用量]\n" +
+			"<i>联通时间: [联通时间]</i>"
+	} else if !updateBaseline {
+		if diffMinutes > 0 {
+			defaultBotTitle = fmt.Sprintf("🔍 <b>联通跳点回溯查询 (%d分钟)</b>", diffMinutes)
+		} else {
+			defaultBotTitle = "⚡ <b>联通实时跳点查询</b>"
+		}
+	} else {
+		defaultBotTitle = "⚡ <b>联通实时跳点播报</b>"
+	}
 
 	botTitleTpl := getEnv("ChinaUnicom_10010v4_bot_title", defaultBotTitle)
 	botDescTpl := getEnv("ChinaUnicom_10010v4_bot_desc", defaultBotDesc)
@@ -967,6 +1168,38 @@ func stopDaemon() {
 
 // ======================== 后台 TG 响应协程 ========================
 
+func buildTGInlineKeyboard(diffMin int) map[string]interface{} {
+	refreshLabel := "🔄 刷新当前"
+	if diffMin > 0 {
+		refreshLabel = fmt.Sprintf("🔄 刷新 (%d分钟)", diffMin)
+	} else if diffMin == -1 {
+		refreshLabel = "🔄 刷新总余量"
+	} else if botDiffMinutes > 0 {
+		refreshLabel = fmt.Sprintf("🔄 刷新 (%d分钟)", botDiffMinutes)
+	}
+	botMin := botDiffMinutes
+	if botMin <= 0 {
+		botMin = 30
+	}
+	return map[string]interface{}{
+		"inline_keyboard": [][]map[string]string{
+			{
+				{"text": refreshLabel, "callback_data": fmt.Sprintf("refresh_%d", diffMin)},
+				{"text": "⚡ 实时跳点", "callback_data": "refresh_0"},
+			},
+			{
+				{"text": fmt.Sprintf("🔍 查询跳点 (%d分)", botMin), "callback_data": fmt.Sprintf("refresh_%d", botMin)},
+				{"text": "📦 套餐总余量", "callback_data": "refresh_-1"},
+			},
+			{
+				{"text": "⏱ 5分钟", "callback_data": "refresh_5"},
+				{"text": "⏱ 10分钟", "callback_data": "refresh_10"},
+				{"text": "⏱ 30分钟", "callback_data": "refresh_30"},
+			},
+		},
+	}
+}
+
 func runTGDaemon() {
 	if tgBotToken == "" {
 		return
@@ -976,6 +1209,16 @@ func runTGDaemon() {
 		fmt.Println("ℹ️ [Go-v4x] 已有守护进程在运行，本次不重复启动")
 		return
 	}
+
+	// 注册 Telegram 官方菜单指令
+	tgSend("setMyCommands", map[string]interface{}{
+		"commands": []map[string]string{
+			{"command": "check", "description": "⚡ 实时跳点 (对比上次自动巡检)"},
+			{"command": "diff", "description": "🔍 查询跳点 (回溯独立时长)"},
+			{"command": "total", "description": "📦 套餐总余量"},
+			{"command": "help", "description": "💡 帮助与使用指南"},
+		},
+	})
 
 	cleanup := func() {
 		if readPidFile() == os.Getpid() {
@@ -994,6 +1237,33 @@ func runTGDaemon() {
 		<-sigChan
 		cancel()
 		cleanup()
+	}()
+
+	// 🌟 启动后台自动回环检测协程（定时巡检 + 自动报警 + 24小时历史快照时间线持续注入）
+	go func() {
+		loopMin, _ := strconv.Atoi(getEnv("AUTO_CHECK_INTERVAL_MIN", "5"))
+		if loopMin <= 0 {
+			loopMin = 5
+		}
+		fmt.Printf("🔄 [Go-v4x] 启动后台回环检测引擎 (每 %d 分钟巡检一次)\n", loopMin)
+		ticker := time.NewTicker(time.Duration(loopMin) * time.Minute)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				cks := getCookies()
+				for idx, c := range cks {
+					title := fmt.Sprintf("账号 %d", idx+1)
+					r, err := fetchAndCalculate(c, idx, true, 0)
+					if err == nil && r != nil {
+						checkAndSendAlert(r, title)
+					}
+				}
+			}
+		}
 	}()
 
 	store := loadStoreSafe()
@@ -1047,14 +1317,22 @@ func runTGDaemon() {
 			Result      []struct {
 				UpdateID int64 `json:"update_id"`
 				Message  *struct {
+					From *struct {
+						ID    int64 `json:"id"`
+						IsBot bool  `json:"is_bot"`
+					} `json:"from"`
 					Chat struct {
 						ID int64 `json:"id"`
 					} `json:"chat"`
 					Text string `json:"text"`
 				} `json:"message"`
 				CallbackQuery *struct {
-					ID      string `json:"id"`
-					Data    string `json:"data"`
+					ID   string `json:"id"`
+					Data string `json:"data"`
+					From *struct {
+						ID    int64 `json:"id"`
+						IsBot bool  `json:"is_bot"`
+					} `json:"from"`
 					Message struct {
 						MessageID int64 `json:"message_id"`
 						Chat      struct {
@@ -1086,6 +1364,11 @@ func runTGDaemon() {
 
 			if upd.Message != nil {
 				msg := upd.Message
+				// 守卫 1: 自回复回环防御，忽略所有 Bot 发言
+				if msg.From != nil && msg.From.IsBot {
+					continue
+				}
+
 				chatID := strconv.FormatInt(msg.Chat.ID, 10)
 				text := strings.TrimSpace(msg.Text)
 
@@ -1109,23 +1392,73 @@ func runTGDaemon() {
 					}
 				}
 
+				// 守卫 1: 非白名单授权用户一律跳过
 				if chatID != owner {
 					continue
 				}
 
+				var isQueryCmd bool
+				var queryMinutes int = 0
+
 				if text == "/start" || text == "/help" {
 					tgSend("sendMessage", map[string]interface{}{
 						"chat_id":    chatID,
-						"text":       "👋 [Go-v4x] 监控在线！\n点击下方大按钮随时查：",
+						"text":       "👋 <b>[Go-v4x] 联通监控在线！</b>\n\n" +
+							"💡 <b>菜单功能指南：</b>\n" +
+							"• <b>⚡ 实时跳点</b> (<code>/check</code>) : 对比上次自动巡检的实时跳点\n" +
+							"• <b>🔍 查询跳点</b> (<code>/diff</code>) : 回溯独立时长（如 5 分钟）对比差值\n" +
+							"• <b>📦 套餐总余量</b> (<code>/total</code>) : 查看当前套餐余量与今日用量\n\n" +
+							"💡 <b>高级指令：</b>\n" +
+							"• 可随时输入指定分钟数，如 <code>/check 10</code>、<code>/check 30</code>\n" +
+							"• 亦可直接发送纯文字，例如 <code>5分钟</code>、<code>10分钟</code>\n\n" +
+							"👇 点击下方菜单大按钮即可快速查询：",
 						"parse_mode": "HTML",
 						"reply_markup": map[string]interface{}{
 							"keyboard": [][]map[string]string{
-								{{"text": "⚡ 实时查跳点"}, {"text": "📦 套餐总余量"}},
+								{{"text": "⚡ 实时跳点"}, {"text": "🔍 查询跳点"}},
+								{{"text": "📦 套餐总余量"}},
 							},
 							"resize_keyboard": true,
 						},
 					})
-				} else if text == "/check" || text == "⚡ 实时查跳点" || text == "📦 套餐总余量" {
+				} else if text == "/check" || text == "⚡ 实时跳点" || text == "⚡ 实时查跳点" {
+					isQueryCmd = true
+					queryMinutes = 0
+				} else if text == "/diff" || text == "🔍 查询跳点" || text == "查询跳点" {
+					isQueryCmd = true
+					if botDiffMinutes > 0 {
+						queryMinutes = botDiffMinutes
+					} else {
+						queryMinutes = 30
+					}
+				} else if text == "📦 套餐总余量" || text == "/total" {
+					isQueryCmd = true
+					queryMinutes = -1
+				} else if text == "⏱ 查5分钟跳点" || text == "5分钟" || text == "5m" {
+					isQueryCmd = true
+					queryMinutes = 5
+				} else if text == "⏱ 查10分钟跳点" || text == "10分钟" || text == "10m" {
+					isQueryCmd = true
+					queryMinutes = 10
+				} else if strings.HasPrefix(text, "/check") || strings.HasPrefix(text, "/diff") || strings.HasPrefix(text, "/查") {
+					parts := strings.Fields(text)
+					isQueryCmd = true
+					if len(parts) >= 2 {
+						cleaned := strings.TrimSuffix(strings.TrimSuffix(parts[1], "分钟"), "m")
+						if m, err := strconv.Atoi(cleaned); err == nil && m > 0 {
+							queryMinutes = m
+						}
+					}
+				} else if matched, _ := regexp.MatchString(`^\d+\s*(?:分钟|min|m)$`, text); matched {
+					re := regexp.MustCompile(`\d+`)
+					numStr := re.FindString(text)
+					if m, err := strconv.Atoi(numStr); err == nil && m > 0 {
+						isQueryCmd = true
+						queryMinutes = m
+					}
+				}
+
+				if isQueryCmd {
 					cookies := getCookies()
 					if len(cookies) == 0 {
 						tgSend("sendMessage", map[string]interface{}{
@@ -1156,33 +1489,41 @@ func runTGDaemon() {
 
 						atomic.StoreInt64(&lastManualQueryAt, nowMs)
 
-						go func(c string, cid string) {
+						go func(cks []string, cid string, qMin int) {
 							defer atomic.StoreInt32(&isQueryingAtomic, 0)
-							res, err := fetchAndCalculate(c, 0, false)
-							if err != nil {
-								tgSend("sendMessage", map[string]interface{}{
-									"chat_id": cid,
-									"text":    fmt.Sprintf("❌ 查询失败: %s", html.EscapeString(err.Error())),
-								})
-							} else {
-								tgSend("sendMessage", map[string]interface{}{
-									"chat_id":    cid,
-									"text":       res.BotContent,
-									"parse_mode": "HTML",
-									"reply_markup": map[string]interface{}{
-										"inline_keyboard": [][]map[string]string{
-											{{"text": "🔄 刷新跳点", "callback_data": "refresh_jump"}},
-										},
-									},
-								})
+							for i, c := range cks {
+								accTitle := fmt.Sprintf("账号 %d", i+1)
+								res, err := fetchAndCalculate(c, i, false, qMin)
+								if err != nil {
+									tgSend("sendMessage", map[string]interface{}{
+										"chat_id": cid,
+										"text":    fmt.Sprintf("❌ [%s] 查询失败: %s", accTitle, html.EscapeString(err.Error())),
+									})
+								} else {
+									content := res.BotContent
+									if len(cks) > 1 {
+										content = fmt.Sprintf("👤 <b>[%s]</b>\n%s", accTitle, content)
+									}
+									tgSend("sendMessage", map[string]interface{}{
+										"chat_id":      cid,
+										"text":         content,
+										"parse_mode":   "HTML",
+										"reply_markup": buildTGInlineKeyboard(qMin),
+									})
+								}
 							}
-						}(cookies[0], chatID)
+						}(cookies, chatID, queryMinutes)
 					}
 				}
 			}
 
 			if upd.CallbackQuery != nil {
 				cq := upd.CallbackQuery
+				// 守卫 1: 忽略所有 Bot 点击回调
+				if cq.From != nil && cq.From.IsBot {
+					continue
+				}
+
 				chatID := strconv.FormatInt(cq.Message.Chat.ID, 10)
 				curStore := loadStoreSafe()
 				owner := tgUserID
@@ -1190,7 +1531,15 @@ func runTGDaemon() {
 					owner = curStore.OwnerID
 				}
 
-				if chatID == owner && cq.Data == "refresh_jump" {
+				if chatID == owner && (cq.Data == "refresh_jump" || strings.HasPrefix(cq.Data, "refresh_")) {
+					qMin := 0
+					if strings.HasPrefix(cq.Data, "refresh_") {
+						mStr := strings.TrimPrefix(cq.Data, "refresh_")
+						if m, err := strconv.Atoi(mStr); err == nil {
+							qMin = m
+						}
+					}
+
 					nowMs := time.Now().In(cst).UnixMilli()
 
 					if !atomic.CompareAndSwapInt32(&isQueryingAtomic, 0, 1) {
@@ -1214,30 +1563,32 @@ func runTGDaemon() {
 
 					atomic.StoreInt64(&lastManualQueryAt, nowMs)
 
+					hint := "正在查询最新跳点..."
+					if qMin > 0 {
+						hint = fmt.Sprintf("正在对比 %d 分钟前消耗...", qMin)
+					} else if qMin == -1 {
+						hint = "正在查询套餐总余量..."
+					}
 					tgSend("answerCallbackQuery", map[string]interface{}{
 						"callback_query_id": cq.ID,
-						"text":              "正在查询最新跳点...",
+						"text":              hint,
 					})
 
 					cookies := getCookies()
 					if len(cookies) > 0 {
-						go func(c string, cid string, msgID int64) {
+						go func(c string, cid string, msgID int64, reqMin int) {
 							defer atomic.StoreInt32(&isQueryingAtomic, 0)
-							res, err := fetchAndCalculate(c, 0, false)
+							res, err := fetchAndCalculate(c, 0, false, reqMin)
 							if err == nil {
 								tgSend("editMessageText", map[string]interface{}{
-									"chat_id":    cid,
-									"message_id": msgID,
-									"text":       res.BotContent,
-									"parse_mode": "HTML",
-									"reply_markup": map[string]interface{}{
-										"inline_keyboard": [][]map[string]string{
-											{{"text": "🔄 刷新跳点", "callback_data": "refresh_jump"}},
-										},
-									},
+									"chat_id":      cid,
+									"message_id":   msgID,
+									"text":         res.BotContent,
+									"parse_mode":   "HTML",
+									"reply_markup": buildTGInlineKeyboard(reqMin),
 								})
 							}
-						}(cookies[0], chatID, cq.Message.MessageID)
+						}(cookies[0], chatID, cq.Message.MessageID, qMin)
 					} else {
 						atomic.StoreInt32(&isQueryingAtomic, 0)
 					}
@@ -1254,6 +1605,111 @@ func runTGDaemon() {
 		}
 
 		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// ======================== 告警判定与精准推送 ========================
+
+func checkAndSendAlert(res *QueryResult, accTitle string) {
+	if res == nil {
+		return
+	}
+
+	// 双独立阈值判定
+	isNormTriggered := minNormUsage > 0 && res.DiffNormal >= minNormUsage
+	isFreeTriggered := minFreeUsage > 0 && res.DiffFree >= minFreeUsage
+
+	// 越级放行仅针对通用流量
+	isBypass := alertBypassMb > 0 && res.DiffNormal >= alertBypassMb
+
+	var allowSend bool
+	var normPassed, freePassed bool
+	var triggerReasons []string
+	now := time.Now().In(cst).UnixMilli()
+
+	_, _ = lockAndModifyStore(func(s *StoreData) bool {
+		acc := s.Accounts[res.AccKey]
+		if acc == nil {
+			return false
+		}
+
+		// 兼容老版本单字段平滑升级
+		if acc.LastAlertNorm == 0 && acc.LastAlertTime > 0 {
+			acc.LastAlertNorm = acc.LastAlertTime
+		}
+
+		// 1. 通用跳点判定
+		if isNormTriggered {
+			if isBypass || alertCooldown <= 0 || acc.LastAlertNorm == 0 || (now-acc.LastAlertNorm) >= alertCooldown.Milliseconds() {
+				normPassed = true
+				acc.LastAlertNorm = now
+				reason := fmt.Sprintf("通用跳点 +%s >= %s", formatFlow(res.DiffNormal), formatFlow(minNormUsage))
+				if isBypass {
+					reason += " [越级放行]"
+				}
+				triggerReasons = append(triggerReasons, reason)
+			} else {
+				fmt.Printf("⏳ [%s] 通用跳点已达标 (+%s)，但在冷却期内 (%s)，跳过该项推送\n",
+					accTitle, formatFlow(res.DiffNormal), cooldownText(alertCooldown))
+			}
+		}
+
+		// 2. 免流跳点判定（独立通道、独立冷却）
+		if isFreeTriggered {
+			if freeAlertCooldown <= 0 || acc.LastAlertFree == 0 || (now-acc.LastAlertFree) >= freeAlertCooldown.Milliseconds() {
+				freePassed = true
+				acc.LastAlertFree = now
+				triggerReasons = append(triggerReasons, fmt.Sprintf("免流跳点 +%s >= %s", formatFlow(res.DiffFree), formatFlow(minFreeUsage)))
+			} else {
+				fmt.Printf("⏳ [%s] 免流跳点已达标 (+%s)，但在免流冷却期内 (%s)，跳过该项推送\n",
+					accTitle, formatFlow(res.DiffFree), cooldownText(freeAlertCooldown))
+			}
+		}
+
+		allowSend = normPassed || freePassed
+		return allowSend
+	})
+
+	if allowSend {
+		var prefix string
+		if normPassed && freePassed {
+			prefix = "🟡 [混合] "
+		} else if normPassed {
+			prefix = "🔴 [跳点] "
+		} else if freePassed {
+			prefix = "🟢 [免流] "
+		}
+
+		finalAutoTitle := prefix + res.AutoTitle
+		finalBotContent := strings.Replace(
+			res.BotContent,
+			"⚡ <b>联通实时跳点播报</b>",
+			prefix+"<b>联通实时跳点播报</b>",
+			1,
+		)
+
+		fmt.Printf("🚀 [%s] 触发报警 (%s)，发送通知！\n", accTitle, strings.Join(triggerReasons, " | "))
+		sendDingTalk(finalAutoTitle, res.AutoContent)
+
+		store := loadStoreSafe()
+		owner := tgUserID
+		if owner == "" {
+			owner = store.OwnerID
+		}
+
+		if tgBotToken != "" && owner != "" {
+			tgSend("sendMessage", map[string]interface{}{
+				"chat_id":      owner,
+				"text":         finalBotContent,
+				"parse_mode":   "HTML",
+				"reply_markup": buildTGInlineKeyboard(0),
+			})
+		}
+	} else if !isNormTriggered && !isFreeTriggered {
+		fmt.Printf("⏳ [%s] 本次通用(+%s / 阈值 %s)与免流(+%s / 阈值 %s)均未达标，静默不扰。\n",
+			accTitle,
+			formatFlow(res.DiffNormal), thresholdText(minNormUsage),
+			formatFlow(res.DiffFree), thresholdText(minFreeUsage))
 	}
 }
 
@@ -1316,7 +1772,7 @@ func main() {
 		accTitle := fmt.Sprintf("账号 %d", idx+1)
 		fmt.Printf("\n========== 🚀 开始检测 [%s] ==========\n", accTitle)
 
-		res, err := fetchAndCalculate(cookie, idx, true)
+		res, err := fetchAndCalculate(cookie, idx, true, 0)
 		if err != nil {
 			fmt.Printf("❌ [%s] 查询异常: %v\n", accTitle, err)
 
@@ -1335,110 +1791,7 @@ func main() {
 		fmt.Printf("⏱ 距上次检测: %s | 本次合计跳点: +%s (通用+%s, 免流+%s)\n",
 			res.DurationStr, formatFlow(res.TotalDiffMb), formatFlow(res.DiffNormal), formatFlow(res.DiffFree))
 
-		// 双独立阈值判定
-		isNormTriggered := minNormUsage > 0 && res.DiffNormal >= minNormUsage
-		isFreeTriggered := minFreeUsage > 0 && res.DiffFree >= minFreeUsage
-
-		// 越级放行仅针对通用流量
-		isBypass := alertBypassMb > 0 && res.DiffNormal >= alertBypassMb
-
-		var allowSend bool
-		var normPassed, freePassed bool
-		var triggerReasons []string
-		now := time.Now().In(cst).UnixMilli()
-
-		_, _ = lockAndModifyStore(func(s *StoreData) bool {
-			acc := s.Accounts[res.AccKey]
-			if acc == nil {
-				return false
-			}
-
-			// 兼容老版本单字段平滑升级
-			if acc.LastAlertNorm == 0 && acc.LastAlertTime > 0 {
-				acc.LastAlertNorm = acc.LastAlertTime
-			}
-
-			// 1. 通用跳点判定
-			if isNormTriggered {
-				if isBypass || alertCooldown <= 0 || acc.LastAlertNorm == 0 || (now-acc.LastAlertNorm) >= alertCooldown.Milliseconds() {
-					normPassed = true
-					acc.LastAlertNorm = now
-					reason := fmt.Sprintf("通用跳点 +%s >= %s", formatFlow(res.DiffNormal), formatFlow(minNormUsage))
-					if isBypass {
-						reason += " [越级放行]"
-					}
-					triggerReasons = append(triggerReasons, reason)
-				} else {
-					fmt.Printf("⏳ [%s] 通用跳点已达标 (+%s)，但在冷却期内 (%s)，跳过该项推送\n",
-						accTitle, formatFlow(res.DiffNormal), cooldownText(alertCooldown))
-				}
-			}
-
-			// 2. 免流跳点判定（独立通道、独立冷却）
-			if isFreeTriggered {
-				if freeAlertCooldown <= 0 || acc.LastAlertFree == 0 || (now-acc.LastAlertFree) >= freeAlertCooldown.Milliseconds() {
-					freePassed = true
-					acc.LastAlertFree = now
-					triggerReasons = append(triggerReasons, fmt.Sprintf("免流跳点 +%s >= %s", formatFlow(res.DiffFree), formatFlow(minFreeUsage)))
-				} else {
-					fmt.Printf("⏳ [%s] 免流跳点已达标 (+%s)，但在免流冷却期内 (%s)，跳过该项推送\n",
-						accTitle, formatFlow(res.DiffFree), cooldownText(freeAlertCooldown))
-				}
-			}
-
-			allowSend = normPassed || freePassed
-			return allowSend
-		})
-
-		if allowSend {
-			// 🌟 动态注入前缀：
-			// 🔴 [跳点]（只有通用跳点达标）
-			// 🟢 [免流]（只有免流跳点达标）
-			// 🟡 [混合]（通用与免流同时达标）
-			var prefix string
-			if normPassed && freePassed {
-				prefix = "🟡 [混合] "
-			} else if normPassed {
-				prefix = "🔴 [跳点] "
-			} else if freePassed {
-				prefix = "🟢 [免流] "
-			}
-
-			finalAutoTitle := prefix + res.AutoTitle
-			finalBotContent := strings.Replace(
-				res.BotContent,
-				"⚡ <b>联通实时跳点播报</b>",
-				prefix+"<b>联通实时跳点播报</b>",
-				1,
-			)
-
-			fmt.Printf("🚀 [%s] 触发报警 (%s)，发送通知！\n", accTitle, strings.Join(triggerReasons, " | "))
-			sendDingTalk(finalAutoTitle, res.AutoContent)
-
-			store := loadStoreSafe()
-			owner := tgUserID
-			if owner == "" {
-				owner = store.OwnerID
-			}
-
-			if tgBotToken != "" && owner != "" {
-				tgSend("sendMessage", map[string]interface{}{
-					"chat_id":    owner,
-					"text":       finalBotContent,
-					"parse_mode": "HTML",
-					"reply_markup": map[string]interface{}{
-						"inline_keyboard": [][]map[string]string{
-							{{"text": "🔄 刷新跳点", "callback_data": "refresh_jump"}},
-						},
-					},
-				})
-			}
-		} else if !isNormTriggered && !isFreeTriggered {
-			fmt.Printf("⏳ [%s] 本次通用(+%s / 阈值 %s)与免流(+%s / 阈值 %s)均未达标，静默不扰。\n",
-				accTitle,
-				formatFlow(res.DiffNormal), thresholdText(minNormUsage),
-				formatFlow(res.DiffFree), thresholdText(minFreeUsage))
-		}
+		checkAndSendAlert(res, accTitle)
 	}
 
 	os.Exit(0)

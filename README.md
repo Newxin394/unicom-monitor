@@ -38,15 +38,23 @@
 | 变量名 | 说明 | 必填 | 默认值 / 示例 |
 | :--- | :--- | :---: | :--- |
 | `UNICOM_COOKIE` | 联通手机营业厅抓取的完整 Cookie（支持多账号换行） | **是** | `acw_tc=...; c_id=...;` |
-| `ChinaUnicom_10010v4_min_usage` | **通用跳点**报警阈值 (MB)，0 为关闭 | 否 | `50` |
-| `ChinaUnicom_10010v4_min_free_usage` | **免流跳点**报警阈值 (MB)，0 为关闭 | 否 | `400` |
+| `ChinaUnicom_10010v4_min_usage` | **自动通用跳点**报警阈值 (MB)，0 为关闭 | 否 | `50` |
+| `ChinaUnicom_10010v4_min_free_usage` | **自动免流跳点**报警阈值 (MB)，0 为关闭 | 否 | `400` |
 | `ChinaUnicom_10010v4_cooldown` | 通用跳点报警冷却时间（秒） | 否 | `0` (不限制) |
 | `ChinaUnicom_10010v4_free_cooldown` | 免流跳点报警冷却时间（秒） | 否 | `1800` (30分钟) |
+| `ChinaUnicom_10010v4_bot_minutes` | **机器人主动查询**默认对比时长（分钟） | 否 | `30` (默认对比 30 分钟前) |
+| `AUTO_CHECK_INTERVAL_MIN` | 守护进程**后台回环检测**周期（分钟） | 否 | `5` (每 5 分钟自动循环检测) |
 | `TG_BOT_TOKEN` | Telegram Bot Token | 否 | `7014392040:AAF4...` |
 | `TG_USER_ID` | Telegram 接收者 User ID | 否 | `1033435406` |
 | `TG_API_HOST` | Telegram API 反代地址（国内服务器推荐） | 否 | `https://api.telegram.org` |
 | `DD_BOT_TOKEN` | 钉钉机器人 Webhook 中的 `access_token` | 否 | `0302c0d50b6...` |
 | `DD_BOT_SECRET` | 钉钉机器人安全设置中的【加签】Secret | 否 | `SECb38f089...` |
+
+> 💬 **Telegram 机器人与回环检测特性**：
+> - **后台回环巡检**：守护进程后台默认每 5 分钟自动执行一次回环检测，向 24 小时历史时间线持续注入快照并触发跳点告警；
+> - **菜单指令**：`⚡ 实时跳点`（对比上次巡检）、`🔍 查询跳点`（默认对比 30 分钟前）、`📦 套餐总余量`；
+> - **自定义时长**：支持输入 `/check 10`、`/check 30` 或直接发送 `10分钟` 回溯任意时长；
+> - **卡片内联切换**：卡片下方支持一键点击 `[ ⏱ 3分钟 ]`、`[ ⏱ 5分钟 ]`、`[ ⏱ 10分钟 ]`、`[ ⏱ 30分钟 ]` 秒级切换。
 
 ---
 
