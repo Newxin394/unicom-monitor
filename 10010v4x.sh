@@ -17,6 +17,13 @@ done
 DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
 
+# 热更新支持：若存在新二进制，杀死旧进程并无缝替换
+if [ -f "./10010v4x.new" ]; then
+    killall -9 10010v4x 2>/dev/null || true
+    rm -f ./10010v4x 2>/dev/null || true
+    mv -f ./10010v4x.new ./10010v4x
+fi
+
 # 赋予可执行权限并启动
 chmod +x ./10010v4x 2>/dev/null || true
 exec ./10010v4x "$@"

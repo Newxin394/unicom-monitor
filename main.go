@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -184,7 +185,7 @@ func init() {
 	// 免流流量跳点阈值，默认 400M；填 0 表示关闭免流告警
 	minFreeUsage, err = strconv.ParseFloat(getEnv("ChinaUnicom_10010v4_min_free_usage", "400"), 64)
 	if err != nil || minFreeUsage < 0 {
-		minFreeUsage = 2000
+		minFreeUsage = 400
 	}
 
 	// 机器人默认独立对比时长（分钟），默认 30 分钟
@@ -236,46 +237,48 @@ func absInt64(n int64) int64 {
 	return n
 }
 
-var configShCache map[string]string
+var (
+	configShCache map[string]string
+	configShOnce  sync.Once
+)
 
 func loadConfigSh() {
-	if configShCache != nil {
-		return
-	}
-	configShCache = make(map[string]string)
-	paths := []string{
-		filepath.Join(scriptDir, "..", "config.sh"),
-		filepath.Join(scriptDir, "config.sh"),
-		filepath.Join(scriptDir, "config", "config.sh"),
-		"/app/Dumb-Panel/config.sh",
-		"/docker/daidai/Dumb-Panel/config.sh",
-		"/ql/data/config/config.sh",
-	}
-	for _, p := range paths {
-		raw, err := os.ReadFile(p)
-		if err != nil {
-			continue
+	configShOnce.Do(func() {
+		configShCache = make(map[string]string)
+		paths := []string{
+			filepath.Join(scriptDir, "..", "config.sh"),
+			filepath.Join(scriptDir, "config.sh"),
+			filepath.Join(scriptDir, "config", "config.sh"),
+			"/app/Dumb-Panel/config.sh",
+			"/docker/daidai/Dumb-Panel/config.sh",
+			"/ql/data/config/config.sh",
 		}
-		for _, line := range strings.Split(string(raw), "\n") {
-			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "#") || !strings.Contains(trimmed, "=") {
+		for _, p := range paths {
+			raw, err := os.ReadFile(p)
+			if err != nil {
 				continue
 			}
-			trimmed = strings.TrimPrefix(trimmed, "export ")
-			parts := strings.SplitN(trimmed, "=", 2)
-			if len(parts) == 2 {
-				k := strings.TrimSpace(parts[0])
-				v := strings.TrimSpace(parts[1])
-				if idx := strings.Index(v, " ##"); idx != -1 {
-					v = strings.TrimSpace(v[:idx])
+			for _, line := range strings.Split(string(raw), "\n") {
+				trimmed := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmed, "#") || !strings.Contains(trimmed, "=") {
+					continue
 				}
-				v = strings.Trim(v, "\"'`")
-				if _, exists := configShCache[k]; !exists {
-					configShCache[k] = v
+				trimmed = strings.TrimPrefix(trimmed, "export ")
+				parts := strings.SplitN(trimmed, "=", 2)
+				if len(parts) == 2 {
+					k := strings.TrimSpace(parts[0])
+					v := strings.TrimSpace(parts[1])
+					if idx := strings.Index(v, " ##"); idx != -1 {
+						v = strings.TrimSpace(v[:idx])
+					}
+					v = strings.Trim(v, "\"'`")
+					if _, exists := configShCache[k]; !exists {
+						configShCache[k] = v
+					}
 				}
 			}
 		}
-	}
+	})
 }
 
 func getEnv(key, def string) string {
@@ -715,12 +718,23 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 					rem = tot - u
 				}
 
-				// 深度免流特征识别（兼容畅视、直播、专享免费、专属流量等特定省份命名）
-				isFree := item.FlowType == "2" || item.FlowType == "3" ||
-					res.Type == "MlFlowdetailsList" ||
-					strings.Contains(name, "免流") || strings.Contains(name, "定向") ||
-					strings.Contains(name, "直播") || strings.Contains(name, "畅视") ||
-					strings.Contains(name, "专享免费") || strings.Contains(name, "专属流量")
+				// 分流逻辑：以 flowType 为最高准则，杜绝整表误判通用流量
+				var isFree bool
+				if item.FlowType == "1" {
+					isFree = false
+				} else if item.FlowType == "2" || item.FlowType == "3" {
+					isFree = true
+				} else {
+					// 当 flowType 缺省或未知时，由套餐名称特征深度判定
+					isFree = strings.Contains(name, "免流") || strings.Contains(name, "定向") ||
+						strings.Contains(name, "直播") || strings.Contains(name, "畅视") ||
+						strings.Contains(name, "专享免费") || strings.Contains(name, "专属流量")
+				}
+
+				if getEnv("ChinaUnicom_10010v4_debug", "0") == "1" {
+					fmt.Printf("🔍 [DEBUG-分流] 项: %s | flowType: %s | isFree: %v | isUnlimit: %v | tot: %.2f | use: %.2f | rem: %.2f\n",
+						name, item.FlowType, isFree, isUnlimit, tot, u, rem)
+				}
 
 				if isFree {
 					if isUnlimit {
@@ -938,21 +952,30 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 		if effectiveMinutes > 0 && len(acc.History) > 0 {
 			targetTs := now.UnixMilli() - int64(effectiveMinutes)*60*1000
 			var bestRecord *SnapshotRecord
+			var isExactFloor bool
 
 			for i := len(acc.History) - 1; i >= 0; i-- {
 				if acc.History[i].Timestamp <= targetTs {
 					bestRecord = &acc.History[i]
+					isExactFloor = true
 					break
 				}
 			}
 			if bestRecord == nil {
 				bestRecord = &acc.History[0]
+				isExactFloor = false
 			}
 
 			if bestRecord != nil && bestRecord.Snapshot != nil {
 				baseSnap = bestRecord.Snapshot
 				baseTime = bestRecord.Timestamp
 				isHistoryMatch = true
+				if isExactFloor {
+					durationStr = fmt.Sprintf("对比 %d分钟前 (基线 %s)", effectiveMinutes, time.UnixMilli(baseTime).In(cst).Format("15:04:05"))
+				} else {
+					elapsed := now.Sub(time.UnixMilli(baseTime))
+					durationStr = fmt.Sprintf("对比 %s (最老快照 %s)", formatDuration(elapsed), time.UnixMilli(baseTime).In(cst).Format("15:04:05"))
+				}
 			}
 		}
 
@@ -963,9 +986,7 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 
 		if baseSnap != nil && baseTime > 0 {
 			elapsed := now.Sub(time.UnixMilli(baseTime))
-			if isHistoryMatch {
-				durationStr = fmt.Sprintf("对比 %d分钟前 (基线 %s)", effectiveMinutes, time.UnixMilli(baseTime).In(cst).Format("15:04:05"))
-			} else {
+			if !isHistoryMatch {
 				durationStr = formatDuration(elapsed)
 			}
 
@@ -1258,32 +1279,31 @@ func runTGDaemon() {
 		cleanup()
 	}()
 
-	// 🌟 启动后台自动回环检测协程（定时巡检 + 自动报警 + 24小时历史快照时间线持续注入）
-	go func() {
-		loopMin, _ := strconv.Atoi(getEnv("AUTO_CHECK_INTERVAL_MIN", "5"))
-		if loopMin <= 0 {
-			loopMin = 5
-		}
-		fmt.Printf("🔄 [Go-v4x] 启动后台回环检测引擎 (每 %d 分钟巡检一次)\n", loopMin)
-		ticker := time.NewTicker(time.Duration(loopMin) * time.Minute)
-		defer ticker.Stop()
+	// 🌟 后台可选回环检测协程（默认 0 由外部 Crontab 驱动；若设 >0 则由守护进程内部定时触发）
+	loopMin, _ := strconv.Atoi(getEnv("AUTO_CHECK_INTERVAL_MIN", "0"))
+	if loopMin > 0 {
+		go func() {
+			fmt.Printf("🔄 [Go-v4x] 启动内部回环巡检引擎 (每 %d 分钟巡检一次)\n", loopMin)
+			ticker := time.NewTicker(time.Duration(loopMin) * time.Minute)
+			defer ticker.Stop()
 
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				cks := getCookies()
-				for idx, c := range cks {
-					title := fmt.Sprintf("账号 %d", idx+1)
-					r, err := fetchAndCalculate(c, idx, true, 0)
-					if err == nil && r != nil {
-						checkAndSendAlert(r, title)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					cks := getCookies()
+					for idx, c := range cks {
+						title := fmt.Sprintf("账号 %d", idx+1)
+						r, err := fetchAndCalculate(c, idx, true, 0)
+						if err == nil && r != nil {
+							checkAndSendAlert(r, title)
+						}
 					}
 				}
 			}
-		}
-	}()
+		}()
+	}
 
 	store := loadStoreSafe()
 	var offset int64 = 0
@@ -1313,6 +1333,8 @@ func runTGDaemon() {
 			r.Body.Close()
 		}
 	}
+
+	lastSavedOffset := offset
 
 	for {
 		select {
@@ -1620,12 +1642,15 @@ func runTGDaemon() {
 			}
 		}
 
-		if offset != store.TGOffset {
+		if offset != lastSavedOffset {
 			_, _ = lockAndModifyStore(func(s *StoreData) bool {
 				s.TGOffset = offset
 				return true
 			})
-			store.TGOffset = offset
+			lastSavedOffset = offset
+			if store != nil {
+				store.TGOffset = offset
+			}
 		}
 
 		time.Sleep(500 * time.Millisecond)
@@ -1651,7 +1676,7 @@ func checkAndSendAlert(res *QueryResult, accTitle string) {
 	var triggerReasons []string
 	now := time.Now().In(cst).UnixMilli()
 
-	_, _ = lockAndModifyStore(func(s *StoreData) bool {
+	_, lockErr := lockAndModifyStore(func(s *StoreData) bool {
 		acc := s.Accounts[res.AccKey]
 		if acc == nil {
 			return false
@@ -1693,6 +1718,19 @@ func checkAndSendAlert(res *QueryResult, accTitle string) {
 		allowSend = normPassed || freePassed
 		return allowSend
 	})
+
+	if errors.Is(lockErr, ErrAcquireLockTimeout) {
+		fmt.Println("⚠️ [存储] 抢锁超时，告警降级为无冷却强制发送！")
+		normPassed = isNormTriggered
+		freePassed = isFreeTriggered
+		allowSend = isNormTriggered || isFreeTriggered
+		if isNormTriggered {
+			triggerReasons = append(triggerReasons, fmt.Sprintf("通用跳点 +%s [抢锁超时强制放行]", formatFlow(res.DiffNormal)))
+		}
+		if isFreeTriggered {
+			triggerReasons = append(triggerReasons, fmt.Sprintf("免流跳点 +%s [抢锁超时强制放行]", formatFlow(res.DiffFree)))
+		}
+	}
 
 	if allowSend {
 		var prefix string
