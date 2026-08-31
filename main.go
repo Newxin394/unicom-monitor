@@ -75,6 +75,7 @@ type StoreData struct {
 	OwnerID          string                   `json:"ownerId"`
 	TGOffset         int64                    `json:"tgOffset"`
 	LastFaultAlertAt int64                    `json:"lastFaultAlertAt"`
+	Cookies          []string                 `json:"cookies,omitempty"`
 }
 
 type QueryResult struct {
@@ -475,6 +476,11 @@ func getCookies() []string {
 		}
 	}
 	if cookieStr == "" {
+		// 从持久化存储兜底读取，确保独立 daemon 进程在空 env 下依然可用
+		st := loadStoreSafe()
+		if st != nil && len(st.Cookies) > 0 {
+			return st.Cookies
+		}
 		return nil
 	}
 
@@ -485,6 +491,19 @@ func getCookies() []string {
 			list = append(list, trimmed)
 		}
 	}
+
+	// 自动持久化落盘，确保守护进程跨进程共享 Cookie
+	if len(list) > 0 {
+		_ = os.WriteFile(cookieFile, []byte(strings.Join(list, "\n")), 0600)
+		_, _ = lockAndModifyStore(func(s *StoreData) bool {
+			if len(s.Cookies) != len(list) {
+				s.Cookies = list
+				return true
+			}
+			return false
+		})
+	}
+
 	return list
 }
 
@@ -1267,7 +1286,10 @@ func runTGDaemon() {
 	}()
 
 	store := loadStoreSafe()
-	offset := store.TGOffset
+	var offset int64 = 0
+	if store != nil {
+		offset = store.TGOffset
+	}
 
 	if offset == 0 {
 		reqURL := fmt.Sprintf("%s/bot%s/getUpdates?offset=-1&timeout=0", tgApiHost, tgBotToken)
@@ -1284,7 +1306,9 @@ func runTGDaemon() {
 					s.TGOffset = offset
 					return true
 				})
-				store.TGOffset = offset
+				if store != nil {
+					store.TGOffset = offset
+				}
 			}
 			r.Body.Close()
 		}
