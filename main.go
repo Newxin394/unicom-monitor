@@ -151,9 +151,38 @@ func init() {
 	execSelf, err = os.Executable()
 	if err != nil {
 		execSelf = os.Args[0]
-		scriptDir = "."
+	}
+
+	// 智能定位脚本持久化数据目录：
+	// 1. 优先使用面板显式注入的脚本根目录（呆呆面板 DAIDAI_SCRIPTS_DIR、青龙 QL_DIR 等）
+	// 2. 识别并规避 `go run` 产生的临时缓存目录 (/tmp/go-build*)
+	// 3. 回退到真实可执行文件所在目录或当前工作目录
+	if envDir := getEnv("DAIDAI_SCRIPTS_DIR", ""); envDir != "" {
+		scriptDir = envDir
+	} else if qlDir := getEnv("QL_DIR", ""); qlDir != "" {
+		scriptDir = filepath.Join(qlDir, "data", "scripts")
+		if _, err := os.Stat(scriptDir); err != nil {
+			scriptDir = filepath.Join(qlDir, "scripts")
+		}
 	} else {
-		scriptDir = filepath.Dir(execSelf)
+		exeDir := filepath.Dir(execSelf)
+		if strings.Contains(exeDir, "go-build") || strings.HasPrefix(exeDir, os.TempDir()) {
+			if cwd, err := os.Getwd(); err == nil {
+				scriptDir = cwd
+			} else {
+				scriptDir = "."
+			}
+		} else {
+			scriptDir = exeDir
+		}
+	}
+
+	// 若当前由 go run 临时构建启动，修正 execSelf 指向持久化二进制（若存在）
+	if strings.Contains(execSelf, "go-build") || strings.HasPrefix(execSelf, os.TempDir()) {
+		persistentBin := filepath.Join(scriptDir, "10010v4x")
+		if _, statErr := os.Stat(persistentBin); statErr == nil {
+			execSelf = persistentBin
+		}
 	}
 
 	dataFile = filepath.Join(scriptDir, "10010v4x_data.json")
@@ -596,6 +625,77 @@ func sendDingTalk(title, content string) bool {
 	return true
 }
 
+func shouldSendDaidaiNotify() bool {
+	// 1. 显式配置开关优先
+	if getEnv("ENABLE_DAIDAI_NOTIFY", "0") == "1" {
+		return true
+	}
+	// 2. 方案 B（智能兜底）：未配置专属 TG 且未配置专属钉钉时，若检测到处于呆呆面板环境，自动启用面板原生推送通道
+	hasExclusiveChannel := (tgBotToken != "") || (ddBotToken != "")
+	if !hasExclusiveChannel {
+		hasDaidaiEnv := getEnv("DAIDAI_NOTIFY_URL", "") != "" || getEnv("DAIDAI_TOKEN", "") != "" || getEnv("DAIDAI_API_BASE", "") != ""
+		return hasDaidaiEnv
+	}
+	return false
+}
+
+func sendDaidaiNotify(title, content string) bool {
+	notifyURL := getEnv("DAIDAI_NOTIFY_URL", "")
+	apiBase := getEnv("DAIDAI_API_BASE", "")
+	token := getEnv("DAIDAI_TOKEN", "")
+	if token == "" {
+		token = getEnv("DAIDAI_NOTIFY_TOKEN", "")
+	}
+
+	if notifyURL == "" && apiBase != "" {
+		notifyURL = strings.TrimRight(apiBase, "/") + "/notifications/send"
+	}
+
+	if notifyURL == "" || token == "" {
+		return false
+	}
+
+	payload := map[string]interface{}{
+		"title":   title,
+		"content": content,
+	}
+	if chID := getEnv("DAIDAI_NOTIFY_CHANNEL_ID", ""); chID != "" {
+		if id, err := strconv.Atoi(chID); err == nil && id > 0 {
+			payload["channel_id"] = id
+		}
+	}
+
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", notifyURL, bytes.NewBuffer(bodyBytes))
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		fmt.Printf("⚠️ [呆呆面板通知异常]: %v\n", err)
+		return false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		fmt.Println("✅ [呆呆面板通知] 已成功投递至面板推送网关！")
+		return true
+	}
+
+	fmt.Printf("⚠️ [呆呆面板通知失败] HTTP %d\n", resp.StatusCode)
+	return false
+}
+
 func notifyFault(reason string) {
 	now := time.Now().In(cst).UnixMilli()
 	var shouldSend bool
@@ -639,6 +739,10 @@ func notifyFault(reason string) {
 	}
 
 	sendDingTalk(title, body)
+
+	if shouldSendDaidaiNotify() {
+		sendDaidaiNotify(title, body)
+	}
 }
 
 // ======================== 核心数据查询与计算 ========================
@@ -1279,31 +1383,7 @@ func runTGDaemon() {
 		cleanup()
 	}()
 
-	// 🌟 后台可选回环检测协程（默认 0 由外部 Crontab 驱动；若设 >0 则由守护进程内部定时触发）
-	loopMin, _ := strconv.Atoi(getEnv("AUTO_CHECK_INTERVAL_MIN", "0"))
-	if loopMin > 0 {
-		go func() {
-			fmt.Printf("🔄 [Go-v4x] 启动内部回环巡检引擎 (每 %d 分钟巡检一次)\n", loopMin)
-			ticker := time.NewTicker(time.Duration(loopMin) * time.Minute)
-			defer ticker.Stop()
-
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					cks := getCookies()
-					for idx, c := range cks {
-						title := fmt.Sprintf("账号 %d", idx+1)
-						r, err := fetchAndCalculate(c, idx, true, 0)
-						if err == nil && r != nil {
-							checkAndSendAlert(r, title)
-						}
-					}
-				}
-			}
-		}()
-	}
+	// 守护进程专职负责 Telegram 交互长轮询，定时巡检统一由外部 Cron 驱动并兼顾守护进程保活
 
 	store := loadStoreSafe()
 	var offset int64 = 0
@@ -1767,6 +1847,10 @@ func checkAndSendAlert(res *QueryResult, accTitle string) {
 				"reply_markup": buildTGInlineKeyboard(0),
 			})
 		}
+
+		if shouldSendDaidaiNotify() {
+			sendDaidaiNotify(finalAutoTitle, res.AutoContent)
+		}
 	} else if !isNormTriggered && !isFreeTriggered {
 		fmt.Printf("⏳ [%s] 本次通用(+%s / 阈值 %s)与免流(+%s / 阈值 %s)均未达标，静默不扰。\n",
 			accTitle,
@@ -1800,10 +1884,18 @@ func main() {
 			}
 
 			logF, err := os.OpenFile(logPath, flag, 0644)
+			// 🌟 彻底摘除管道：显式绑定独立日志文件或 /dev/null，严禁继承父进程 stdout/stderr/stdin 管道
+			// 避免面板因为等不到管道 EOF 导致任务永远卡在「运行中」及后续写入已关闭管道触发 SIGPIPE 暴毙
+			devNull, _ := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 			cmd := exec.Command(execSelf, "--daemon")
-			if err == nil {
+			cmd.Stdin = devNull
+
+			if err == nil && logF != nil {
 				cmd.Stdout = logF
 				cmd.Stderr = logF
+			} else {
+				cmd.Stdout = devNull
+				cmd.Stderr = devNull
 			}
 			cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 			if err := cmd.Start(); err == nil {
@@ -1811,6 +1903,9 @@ func main() {
 			}
 			if logF != nil {
 				_ = logF.Close()
+			}
+			if devNull != nil {
+				_ = devNull.Close()
 			}
 		}
 		if tgBindSecret == "" && tgUserID == "" && loadStoreSafe().OwnerID == "" {
