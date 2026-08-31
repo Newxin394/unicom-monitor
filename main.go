@@ -1056,29 +1056,40 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 		if effectiveMinutes > 0 && len(acc.History) > 0 {
 			targetTs := now.UnixMilli() - int64(effectiveMinutes)*60*1000
 			var bestRecord *SnapshotRecord
-			var isExactFloor bool
+			var isFloorFound bool
 
 			for i := len(acc.History) - 1; i >= 0; i-- {
 				if acc.History[i].Timestamp <= targetTs {
 					bestRecord = &acc.History[i]
-					isExactFloor = true
+					isFloorFound = true
 					break
 				}
 			}
 			if bestRecord == nil {
+				// 若历史快照均比 targetTs 新（例如刚启动不久，历史不足设定时长），取最老一条
 				bestRecord = &acc.History[0]
-				isExactFloor = false
+				isFloorFound = false
 			}
 
 			if bestRecord != nil && bestRecord.Snapshot != nil {
 				baseSnap = bestRecord.Snapshot
 				baseTime = bestRecord.Timestamp
 				isHistoryMatch = true
-				if isExactFloor {
+
+				elapsed := now.Sub(time.UnixMilli(baseTime))
+				actualDurationStr := formatDuration(elapsed)
+				actualSec := int64(elapsed.Seconds())
+				targetSec := int64(effectiveMinutes * 60)
+
+				// 只有当实际回溯时长与目标时长的误差在 90 秒内（正常巡检周期抖动）时，才视为精准匹配目标分钟数
+				if isFloorFound && absInt64(actualSec-targetSec) <= 90 {
 					durationStr = fmt.Sprintf("对比 %d分钟前 (基线 %s)", effectiveMinutes, time.UnixMilli(baseTime).In(cst).Format("15:04:05"))
+				} else if isFloorFound {
+					// 虽为 Floor 命中，但因接口限流/漏检导致实际回溯窗口与目标不一致（如查30分实际命中45分前）
+					durationStr = fmt.Sprintf("对比 %s前 (目标%d分/基线 %s)", actualDurationStr, effectiveMinutes, time.UnixMilli(baseTime).In(cst).Format("15:04:05"))
 				} else {
-					elapsed := now.Sub(time.UnixMilli(baseTime))
-					durationStr = fmt.Sprintf("对比 %s (最老快照 %s)", formatDuration(elapsed), time.UnixMilli(baseTime).In(cst).Format("15:04:05"))
+					// 历史快照总时长不足目标（如刚启动 8 分钟）
+					durationStr = fmt.Sprintf("对比 %s前 (最老快照 %s)", actualDurationStr, time.UnixMilli(baseTime).In(cst).Format("15:04:05"))
 				}
 			}
 		}
