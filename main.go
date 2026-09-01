@@ -2019,18 +2019,19 @@ func stopDaemon() {
 
 // ======================== 后台 TG 响应协程 ========================
 
+// buildTGInlineKeyboard 构建 TG 内联键盘。
+// diffMin 是当前消息所用的对比时长，刷新键据此重放同一种查询，
+// 标签必须与 callback_data 语义一致（否则会出现"标签写 30 分钟、实际跑实时"的错配）。
 func buildTGInlineKeyboard(diffMin int) map[string]interface{} {
-	refreshLabel := "🔄 刷新当前"
-	if diffMin > 0 {
-		refreshLabel = fmt.Sprintf("🔄 刷新 (%d分钟)", diffMin)
-	} else if diffMin == -1 {
+	var refreshLabel string
+	switch {
+	case diffMin == -1:
 		refreshLabel = "🔄 刷新总余量"
-	} else if botDiffMinutes > 0 {
-		refreshLabel = fmt.Sprintf("🔄 刷新 (%d分钟)", botDiffMinutes)
-	}
-	botMin := botDiffMinutes
-	if botMin <= 0 {
-		botMin = 30
+	case diffMin > 0:
+		refreshLabel = fmt.Sprintf("🔄 刷新 (%d分钟)", diffMin)
+	default:
+		// diffMin == 0：对比上次自动巡检，与「⚡ 实时跳点」同义，不能标成分钟数
+		refreshLabel = "🔄 刷新当前"
 	}
 	return map[string]interface{}{
 		"inline_keyboard": [][]map[string]string{
@@ -2039,7 +2040,6 @@ func buildTGInlineKeyboard(diffMin int) map[string]interface{} {
 				{"text": "⚡ 实时跳点", "callback_data": "refresh_0"},
 			},
 			{
-				{"text": fmt.Sprintf("🔍 查询跳点 (%d分)", botMin), "callback_data": fmt.Sprintf("refresh_%d", botMin)},
 				{"text": "📦 套餐总余量", "callback_data": "refresh_-1"},
 			},
 			{
@@ -2264,8 +2264,8 @@ func runTGDaemon() {
 						"text": "👋 <b>[Go-v4x] 联通监控在线！</b>\n\n" +
 							"💡 <b>菜单功能指南：</b>\n" +
 							"• <b>⚡ 实时跳点</b> (<code>/check</code>) : 对比上次自动巡检的实时跳点\n" +
-							"• <b>🔍 查询跳点</b> (<code>/diff</code>) : 回溯独立时长（如 5 分钟）对比差值\n" +
-							"• <b>📦 套餐总余量</b> (<code>/total</code>) : 查看当前套餐余量与今日用量\n\n" +
+							"• <b>📦 套餐总余量</b> (<code>/total</code>) : 查看当前套餐余量与今日用量\n" +
+							"• <b>⏱ 5 / 10 / 30 分钟</b> (<code>/diff</code>) : 回溯指定时长对比差值\n\n" +
 							"💡 <b>高级指令：</b>\n" +
 							"• 可随时输入指定分钟数，如 <code>/check 10</code>、<code>/check 30</code>\n" +
 							"• 亦可直接发送纯文字，例如 <code>5分钟</code>、<code>10分钟</code>\n\n" +
@@ -2273,8 +2273,8 @@ func runTGDaemon() {
 						"parse_mode": "HTML",
 						"reply_markup": map[string]interface{}{
 							"keyboard": [][]map[string]string{
-								{{"text": "⚡ 实时跳点"}, {"text": "🔍 查询跳点"}},
-								{{"text": "📦 套餐总余量"}},
+								{{"text": "⚡ 实时跳点"}, {"text": "📦 套餐总余量"}},
+								{{"text": "5分钟"}, {"text": "10分钟"}, {"text": "30分钟"}},
 							},
 							"resize_keyboard": true,
 						},
