@@ -12,6 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -403,6 +405,76 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%s小时", trimZero(fmt.Sprintf("%.1f", float64(s)/3600)))
 	}
 	return fmt.Sprintf("%s天", trimZero(fmt.Sprintf("%.1f", float64(s)/86400)))
+}
+
+// ======================== 随机语录生成引擎 ========================
+
+var builtinQuotes = []string{
+	"星光不问赶路人，时光不负有心人。",
+	"生活明朗，万物可爱，人间值得，未来可期。",
+	"不积跬步，无以至千里；不积小流，无以成江海。",
+	"每一个不曾起舞的日子，都是对生命的辜负。",
+	"愿你历尽千帆，归来仍是少年。",
+	"追风赶月莫停留，平芜尽处是春山。",
+	"万物皆有裂痕，那是光照进来的地方。",
+	"保持热爱，奔赴山海。",
+	"知足且上进，温柔且坚定。",
+	"心之所向，素履以往，生如逆旅，一苇以航。",
+	"山有顶峰，湖有彼岸，在人生漫漫长途中，万物皆有回转。",
+	"沉淀自己，默默拔节，终会迎来属于你的繁花似锦。",
+	"日出有盼，日落有念，平淡日子里泛着光。",
+	"慢品人间烟火色，闲观万事岁月长。",
+	"向光而行，不负韶华。",
+	"今天也是元气满满、充满希望的一天！",
+	"行远自迩，笃行不怠。",
+	"岁月漫长，值得等待；心怀浪漫，所遇皆温柔。",
+	"博观而约取，厚积而薄发。",
+	"愿你眼中有星辰，心中有山海，以梦为马，不负韶华。",
+	"无论身在何处，都要像向日葵一样向阳而生。",
+	"前路浩浩荡荡，万事尽可期待。",
+	"热爱可抵岁月漫长，风雨兼程只为遇见更好的自己。",
+	"流水不争先，争的是滔滔不绝。",
+	"路虽远，行则将至；事虽难，做则必成。",
+}
+
+func getRandomQuote() string {
+	// 1. 若配置了自定义语录（以换行或 | 分隔）
+	if custom := getEnv("ChinaUnicom_10010v4_custom_quotes", getEnv("CUSTOM_QUOTES", "")); custom != "" {
+		var list []string
+		for _, q := range strings.FieldsFunc(custom, func(r rune) bool { return r == '\n' || r == '|' }) {
+			t := strings.TrimSpace(q)
+			if t != "" {
+				list = append(list, t)
+			}
+		}
+		if len(list) > 0 {
+			r := rand.New(rand.NewSource(time.Now().UnixNano()))
+			return list[r.Intn(len(list))]
+		}
+	}
+
+	// 2. 在线获取一言（极速 1.2 秒超时，失败或未开启则优雅回退）
+	if getEnv("ENABLE_ONLINE_QUOTE", "1") != "0" {
+		ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, "GET", "https://v1.hitokoto.cn/?encode=text", nil)
+		if err == nil {
+			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+			if resp, err := httpClient.Do(req); err == nil && resp.StatusCode == http.StatusOK {
+				defer resp.Body.Close()
+				if body, err := io.ReadAll(resp.Body); err == nil {
+					text := strings.TrimSpace(string(body))
+					if len(text) > 0 && len(text) < 120 {
+						return text
+					}
+				}
+			}
+		}
+	}
+
+	// 3. 本地精选语录兜底
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	return builtinQuotes[r.Intn(len(builtinQuotes))]
 }
 
 // 占位符按长度降序替换，防止 [所有通用.用量] 被 [所有通用.用] 短键截胡
@@ -1283,9 +1355,14 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 	vars["[通用速率]"] = normRateStr
 	vars["[免流速率]"] = freeRateStr
 
+	quote := getRandomQuote()
+	vars["[随机语录]"] = quote
+	vars["[一言]"] = quote
+	vars["[语录]"] = quote
+
 	defaultAutoTitle := "[套餐]"
 	defaultAutoSubt := "[时长] 跳 [所有通用.用量] 免 [所有免流.用量]"
-	defaultAutoDesc := "☸️通用总共 [通用有限.总] ✡️\n☯️通用已用 [通用有限.已用]🕎\n🕉️通用剩余 [通用有限.剩余] ☪️\n♒️免流已用 [所有免流.已用] ⛎\n🕉️今日通用 [所有通用.今日用量] 🕉️\n🕉️今日免流 [所有免流.今日用量] 🕉️\n♈️联通时间 [联通时间]♌️"
+	defaultAutoDesc := "☸️通用总共 [通用有限.总] ✡️\n☯️通用已用 [通用有限.已用]🕎\n🕉️通用剩余 [通用有限.剩余] ☪️\n♒️免流已用 [所有免流.已用] ⛎\n🕉️今日通用 [所有通用.今日用量] 🕉️\n🕉️今日免流 [所有免流.今日用量] 🕉️\n♈️联通时间 [联通时间]♌️\n💌语录：[随机语录]"
 
 	autoTitleTpl := getEnv("ChinaUnicom_10010v4_title", defaultAutoTitle)
 	autoSubtTpl := getEnv("ChinaUnicom_10010v4_subt", defaultAutoSubt)
@@ -1300,6 +1377,9 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 	}
 	escapedVars["[套餐]"] = html.EscapeString(pkgName)
 	escapedVars["[联通时间]"] = html.EscapeString(data.Time)
+	escapedVars["[随机语录]"] = html.EscapeString(quote)
+	escapedVars["[一言]"] = html.EscapeString(quote)
+	escapedVars["[语录]"] = html.EscapeString(quote)
 
 	var defaultBotTitle string
 	defaultBotDesc := "━━━━━━━━━━━━━━━━━━\n" +
@@ -1318,6 +1398,8 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 		"• 通用剩余：[所有通用.剩余] (共 [所有通用.总])\n" +
 		"• 免流已用：[所有免流.已用]\n" +
 		"• 语音剩余：[语音.剩余]\n" +
+		"━━━━━━━━━━━━━━━━━━\n" +
+		"💬 <i>[随机语录]</i>\n" +
 		"<i>联通时间: [联通时间]</i>"
 
 	if diffMinutes == -1 {
@@ -1333,6 +1415,8 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 			"📅 <b>今日累计消耗：</b>\n" +
 			"• 今日通用：[所有通用.今日用量]\n" +
 			"• 今日免流：[所有免流.今日用量]\n" +
+			"━━━━━━━━━━━━━━━━━━\n" +
+			"💬 <i>[随机语录]</i>\n" +
 			"<i>联通时间: [联通时间]</i>"
 	} else if !updateBaseline {
 		if diffMinutes > 0 {
