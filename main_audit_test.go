@@ -37,18 +37,24 @@ func TestRenderTemplateEscapedNewline(t *testing.T) {
 }
 
 func TestParseRefreshCallback(t *testing.T) {
+	orig := botDiffMinutes
+	defer func() { botDiffMinutes = orig }()
+	botDiffMinutes = 30
 	cases := []struct {
 		in      string
 		min     int
 		idx     int
 		matched bool
 	}{
-		{"refresh_0_0", 0, 0, true},
-		{"refresh_30_2", 30, 2, true},
-		{"refresh_-1_1", -1, 1, true},
-		{"refresh_0", 0, 0, true},   // 旧格式兼容
-		{"refresh_-1", -1, 0, true}, // 旧格式兼容
-		{"refresh_jump", 0, 0, true},
+		{"refresh_0_0", 30, 0, true},  // 旧版 ⚡ → 新语义（botDiffMinutes）
+		{"refresh_30_2", 30, 2, true}, // 新版 ⚡
+		{"refresh_-1_1", -1, 1, true}, // 总余量
+		{"refresh_-2_0", 0, 0, true},  // 新版巡检视图回放 → 0
+		{"refresh_-2_3", 0, 3, true},
+		{"refresh_0", 30, 0, true},    // 旧格式兼容：同样映射到 botDiffMinutes
+		{"refresh_-1", -1, 0, true},   // 旧格式兼容
+		{"refresh_jump", 30, 0, true}, // 旧版实时跳点 → 新语义
+		{"refresh_60", 60, 0, true},
 		{"refresh_abc", 0, 0, false},
 		{"other", 0, 0, false},
 		{"refresh_30_-5", 30, 0, true}, // 负下标回落 0
@@ -58,6 +64,32 @@ func TestParseRefreshCallback(t *testing.T) {
 		if ok != c.matched || (ok && (min != c.min || idx != c.idx)) {
 			t.Errorf("%s => (%d,%d,%v)，期望 (%d,%d,%v)", c.in, min, idx, ok, c.min, c.idx, c.matched)
 		}
+	}
+}
+
+// 巡检卡片（/check 0）的刷新键编码为 -2，且解析后能回到 0：
+// 编码若沿用 0，会与历史消息上"旧版 ⚡"的 refresh_0 撞车。
+func TestInspectionCardRefreshRoundtrip(t *testing.T) {
+	orig := botDiffMinutes
+	defer func() { botDiffMinutes = orig }()
+	botDiffMinutes = 30
+
+	kb := buildTGInlineKeyboard(0, 0)
+	rows := kb["inline_keyboard"].([][]map[string]string)
+	var refreshKey string
+	for _, row := range rows {
+		for _, k := range row {
+			if k["text"] == "🔄 刷新当前" {
+				refreshKey = k["callback_data"]
+			}
+		}
+	}
+	if refreshKey != "refresh_-2_0" {
+		t.Fatalf("巡检卡片刷新键 = %q，期望 refresh_-2_0", refreshKey)
+	}
+	min, _, ok := parseRefreshCallback(refreshKey)
+	if !ok || min != 0 {
+		t.Fatalf("refresh_-2_0 解析 => (%d,%v)，期望 (0,true)", min, ok)
 	}
 }
 
