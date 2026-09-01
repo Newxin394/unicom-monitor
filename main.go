@@ -5,7 +5,10 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/md5"
+	crand "crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -85,6 +88,10 @@ type StoreData struct {
 	TGOffset         int64                    `json:"tgOffset"`
 	LastFaultAlertAt int64                    `json:"lastFaultAlertAt"`
 	Cookies          []string                 `json:"cookies,omitempty"`
+	// 【自动登录】上次自动登录成功时被替换的 env 配置指纹（cookie+token_online 组合 md5）。
+	// 当 env 配置与该指纹一致时视为"env 已过期"，自动登录产生的新凭据优先；
+	// 用户修改 env（指纹变化）后 env 立即重新接管。
+	LoginEnvEpoch string `json:"loginEnvEpoch,omitempty"`
 }
 
 type QueryResult struct {
@@ -115,6 +122,8 @@ var (
 	lockFile   string
 	pidFile    string
 	cookieFile string
+
+	tokenOnlineFile string
 
 	tgBotToken   string
 	tgUserID     string
@@ -224,6 +233,7 @@ func init() {
 	lockFile = filepath.Join(scriptDir, "10010v4x_store.lock")
 	pidFile = filepath.Join(scriptDir, "10010v4x_tg_bot.pid")
 	cookieFile = filepath.Join(scriptDir, "10010v4_cookie.txt")
+	tokenOnlineFile = filepath.Join(scriptDir, "10010v4_token_online.txt")
 
 	// 清理历史崩溃遗留的 .tmp 中间文件
 	if matches, _ := filepath.Glob(dataFile + ".*.tmp"); len(matches) > 0 {
@@ -702,11 +712,23 @@ func loadStoreSafe() *StoreData {
 
 // 只按换行拆分 Cookie，绝不按 & 拆（Cookie 内部本身就含 &）
 func getCookies() []string {
-	cookieStr := getEnv("UNICOM_COOKIE", getEnv("ChinaUnicom_10010v4_cookie", ""))
-	if cookieStr == "" {
-		if data, err := os.ReadFile(cookieFile); err == nil {
-			cookieStr = strings.TrimSpace(string(data))
+	envCookie := getEnv("UNICOM_COOKIE", getEnv("ChinaUnicom_10010v4_cookie", ""))
+	fileCookie := ""
+	if data, err := os.ReadFile(cookieFile); err == nil {
+		fileCookie = strings.TrimSpace(string(data))
+	}
+
+	cookieStr := envCookie
+	// 【自动登录接管】env 配置与"上次被自动登录替换的指纹"一致 → env 已过期，用轮换后的文件凭据
+	if envCookie != "" && fileCookie != "" {
+		st := loadStoreSafe()
+		if st != nil && st.LoginEnvEpoch != "" && st.LoginEnvEpoch == envCredFingerprint(envCookie, getEnv("ChinaUnicom_10010v4_token_online", "")) {
+			cookieStr = fileCookie
+			fmt.Println("🔓 [自动登录] env Cookie 已被自动登录轮换接管，使用文件中的新凭据")
 		}
+	}
+	if cookieStr == "" {
+		cookieStr = fileCookie
 	}
 	if cookieStr == "" {
 		// 从持久化存储兜底读取，确保独立 daemon 进程在空 env 下依然可用
@@ -738,6 +760,308 @@ func getCookies() []string {
 	}
 
 	return list
+}
+
+// ======================== TokenOnline 自动登录 (Cookie 失效自愈) ========================
+
+// 联通手厅登录协议常量（逆向自原版脚本并实测验证）
+const (
+	unicomOnlineURL = "https://m.client.10010.com/mobileService/onLine.htm"
+	unicomLoginURL  = "https://m.client.10010.com/mobileService/login.htm"
+	unicomLoginUA   = "Dalvik/2.1.0 (Linux; U; Android 14; 2211133C Build/UKQ1.230804.001);unicom{version:android@11.0900}"
+	unicomAppID     = "ChinaunicomMobileBusiness"
+	unicomAppVer    = "android@11.0900"
+)
+
+// 联通手厅登录 RSA 公钥 (PKCS#1 v1.5, 与 JSEncrypt 兼容)
+const unicomPubKeyB64 = "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDc+CZK9bBA9IU+gZUOc6FUGu7yO9WpTNB0PzmgFBh96Mg1WrovD1oqZ+eIF4LjvxKXGOdI79JRdve9NPhQo07+uqGQgE4imwNnRx7PFtCRryiIEcUoavuNtuRVoBAm6qdB0SrctgaqGfLgKvZHOnwTjyNqjBUxzMeQlEC2czEMSwIDAQAB"
+
+// envCredFingerprint 生成 env 凭据指纹（cookie+token_online 组合 md5 前 16 位）
+// 用于判断"env 配置是否仍是上次被自动登录替换的那份旧值"
+func envCredFingerprint(cookie, tokenOnline string) string {
+	sum := md5.Sum([]byte(cookie + "|" + tokenOnline))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+// getTokenOnlines 读取 token_online 列表（按行，与账号一一对应）。
+// 优先级: 文件(服务器轮换后的最新值) > 环境变量 ChinaUnicom_10010v4_token_online
+func getTokenOnlines() []string {
+	fileToks := readLinesFile(tokenOnlineFile)
+	envTok := strings.TrimSpace(getEnv("ChinaUnicom_10010v4_token_online", ""))
+	if envTok == "" {
+		return fileToks
+	}
+	envToks := splitCookieLines(envTok)
+	if len(fileToks) == 0 {
+		return envToks
+	}
+	// 文件与 env 都有: 仅当 env 未被轮换接管时用 env (与 getCookies 的 epoch 机制对齐)
+	st := loadStoreSafe()
+	if st != nil && st.LoginEnvEpoch != "" && st.LoginEnvEpoch == envCredFingerprint(getEnv("UNICOM_COOKIE", getEnv("ChinaUnicom_10010v4_cookie", "")), envTok) {
+		return fileToks
+	}
+	return envToks
+}
+
+// readLinesFile 按行读取非空行
+func readLinesFile(path string) []string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	return splitCookieLines(string(data))
+}
+
+// splitCookieLines 按换行拆分并去空白（复用 Cookie 的拆分规则）
+func splitCookieLines(s string) []string {
+	var out []string
+	for _, l := range strings.Split(s, "\n") {
+		t := strings.TrimSpace(strings.Trim(l, "\r`"))
+		if len(t) > 20 {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// saveTokenOnline 持久化第 idx 个账号的 token_online（按行对齐，不足补空行占位）
+func saveTokenOnline(idx int, token string) {
+	toks := readLinesFile(tokenOnlineFile)
+	for len(toks) <= idx {
+		toks = append(toks, "")
+	}
+	toks[idx] = token
+	_ = os.WriteFile(tokenOnlineFile, []byte(strings.Join(toks, "\n")), 0600)
+}
+
+// persistCookieLine 更新 cookieFile 中第 idx 行（自动登录换新后调用），并同步 store.Cookies
+func persistCookieLine(idx int, cookie string) {
+	cks := readLinesFile(cookieFile)
+	for len(cks) <= idx {
+		cks = append(cks, "")
+	}
+	cks[idx] = cookie
+	_ = os.WriteFile(cookieFile, []byte(strings.Join(cks, "\n")), 0600)
+	_, _ = lockAndModifyStore(func(s *StoreData) bool {
+		if len(s.Cookies) != len(cks) {
+			s.Cookies = cks
+		} else {
+			s.Cookies[idx] = cookie
+		}
+		return true
+	})
+}
+
+// unicomLoginPost 发起联通手厅登录 POST，返回 (Set-Cookie 拼接, 响应 JSON, 错误)
+func unicomLoginPost(loginURL string, form url.Values) (string, map[string]interface{}, error) {
+	req, err := http.NewRequest("POST", loginURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", nil, fmt.Errorf("构建登录请求失败: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", unicomLoginUA)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", nil, fmt.Errorf("登录网络请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", nil, fmt.Errorf("登录网关异常 (HTTP %d)", resp.StatusCode)
+	}
+
+	// 拼接 Set-Cookie: 每条取 "name=value" 部分（丢弃 Domain/Path/Max-Age 等属性）
+	var cookieParts []string
+	for _, c := range resp.Header.Values("Set-Cookie") {
+		if i := strings.Index(c, ";"); i > 0 {
+			c = c[:i]
+		}
+		if c != "" {
+			cookieParts = append(cookieParts, c)
+		}
+	}
+	newCookie := strings.Join(cookieParts, "; ")
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return newCookie, nil, fmt.Errorf("读取登录响应失败: %w", err)
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal(body, &data); err != nil {
+		return newCookie, nil, fmt.Errorf("解析登录响应失败: %w (body: %.200s)", err, string(body))
+	}
+	return newCookie, data, nil
+}
+
+// loginCodeOK 校验联通登录响应 code == "0"
+func loginCodeOK(data map[string]interface{}) (bool, string) {
+	if data == nil {
+		return false, "响应为空"
+	}
+	code := ""
+	switch v := data["code"].(type) {
+	case string:
+		code = v
+	case float64:
+		code = strconv.FormatFloat(v, 'f', -1, 64)
+	}
+	if code != "0" {
+		msg, _ := data["message"].(string)
+		if msg == "" {
+			msg, _ = data["msg"].(string)
+		}
+		return false, fmt.Sprintf("code=%s %s", code, msg)
+	}
+	return true, ""
+}
+
+// tokenOnlineLogin 使用 token_online 自动登录换新 Cookie（onLine.htm）
+// 返回: 新Cookie, 新token_online(服务器轮换后), 有效期, 错误
+func tokenOnlineLogin(tokenOnline string) (string, string, string, error) {
+	if strings.TrimSpace(tokenOnline) == "" {
+		return "", "", "", fmt.Errorf("token_online 未配置")
+	}
+	form := url.Values{}
+	form.Set("appId", unicomAppID)
+	form.Set("token_online", tokenOnline)
+	form.Set("version", unicomAppVer)
+
+	newCookie, data, err := unicomLoginPost(unicomOnlineURL, form)
+	if err != nil {
+		return "", "", "", err
+	}
+	if ok, why := loginCodeOK(data); !ok {
+		return "", "", "", fmt.Errorf("TokenOnline 登录被拒绝: %s", why)
+	}
+	newToken, _ := data["token_online"].(string)
+	invalidat, _ := data["invalidat"].(string)
+	if newCookie == "" {
+		return "", "", "", fmt.Errorf("登录成功但 Set-Cookie 为空")
+	}
+	return newCookie, newToken, invalidat, nil
+}
+
+// rsaEncryptUnicom 联通登录参数 RSA 加密（PKCS#1 v1.5, 输出 base64, 兼容 JSEncrypt）
+func rsaEncryptUnicom(plain string) (string, error) {
+	keyBytes, err := base64.StdEncoding.DecodeString(unicomPubKeyB64)
+	if err != nil {
+		return "", fmt.Errorf("公钥解码失败: %w", err)
+	}
+	pubAny, err := x509.ParsePKIXPublicKey(keyBytes)
+	if err != nil {
+		return "", fmt.Errorf("公钥解析失败: %w", err)
+	}
+	pub, ok := pubAny.(*rsa.PublicKey)
+	if !ok {
+		return "", fmt.Errorf("非 RSA 公钥")
+	}
+	enc, err := rsa.EncryptPKCS1v15(crand.Reader, pub, []byte(plain))
+	if err != nil {
+		return "", fmt.Errorf("RSA 加密失败: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(enc), nil
+}
+
+// passwordLogin 使用手机号+服务密码登录换新 Cookie（login.htm, RSA 加密）
+func passwordLogin(mobile, password string) (string, string, error) {
+	if mobile == "" || password == "" {
+		return "", "", fmt.Errorf("手机号/服务密码未配置")
+	}
+	encMobile, err := rsaEncryptUnicom(mobile)
+	if err != nil {
+		return "", "", err
+	}
+	encPwd, err := rsaEncryptUnicom(password)
+	if err != nil {
+		return "", "", err
+	}
+	form := url.Values{}
+	form.Set("mobile", encMobile)
+	form.Set("password", encPwd)
+	form.Set("appId", unicomAppID)
+	form.Set("version", unicomAppVer)
+
+	newCookie, data, err := unicomLoginPost(unicomLoginURL, form)
+	if err != nil {
+		return "", "", err
+	}
+	if ok, why := loginCodeOK(data); !ok {
+		return "", "", fmt.Errorf("密码登录被拒绝: %s", why)
+	}
+	newToken, _ := data["token_online"].(string)
+	if newCookie == "" {
+		return "", "", fmt.Errorf("登录成功但 Set-Cookie 为空")
+	}
+	return newCookie, newToken, nil
+}
+
+// autoRelogin Cookie 失效自愈编排: TokenOnline 优先 → 密码登录兜底
+// 成功后持久化新凭据（cookieFile/tokenOnlineFile/store.Cookies/LoginEnvEpoch），返回新 Cookie
+func autoRelogin(idx int, oldCookie string) (string, bool) {
+	envCookie := getEnv("UNICOM_COOKIE", getEnv("ChinaUnicom_10010v4_cookie", ""))
+	envToken := getEnv("ChinaUnicom_10010v4_token_online", "")
+
+	toks := getTokenOnlines()
+	var tok string
+	if idx < len(toks) {
+		tok = toks[idx]
+	}
+
+	// 1. TokenOnline 自动登录
+	if tok != "" {
+		fmt.Printf("🔄 [自动登录] 尝试 TokenOnline 登录 (账号 %d)...\n", idx+1)
+		newCookie, newToken, invalidat, err := tokenOnlineLogin(tok)
+		if err == nil {
+			fmt.Printf("✅ [自动登录] TokenOnline 登录成功 (有效期: %s)，已换新 Cookie (%d 字节)\n",
+				invalidat, len(newCookie))
+			if newToken != "" {
+				saveTokenOnline(idx, newToken)
+			}
+			persistCookieLine(idx, newCookie)
+			markLoginEnvEpoch(envCookie, envToken)
+			return newCookie, true
+		}
+		fmt.Printf("⚠️ [自动登录] TokenOnline 登录失败: %v\n", err)
+	} else {
+		fmt.Println("⚠️ [自动登录] 未配置 ChinaUnicom_10010v4_token_online，跳过 TokenOnline 登录")
+	}
+
+	// 2. 密码登录兜底
+	mobile := strings.TrimSpace(getEnv("ChinaUnicom_10010v4_mobile", ""))
+	password := strings.TrimSpace(getEnv("ChinaUnicom_10010v4_password", ""))
+	if mobile != "" && password != "" {
+		fmt.Printf("🔄 [自动登录] 尝试服务密码登录 (账号 %d)...\n", idx+1)
+		newCookie, newToken, err := passwordLogin(mobile, password)
+		if err == nil {
+			fmt.Printf("✅ [自动登录] 密码登录成功，已换新 Cookie (%d 字节)\n", len(newCookie))
+			if newToken != "" {
+				saveTokenOnline(idx, newToken)
+			}
+			persistCookieLine(idx, newCookie)
+			markLoginEnvEpoch(envCookie, envToken)
+			return newCookie, true
+		}
+		fmt.Printf("⚠️ [自动登录] 密码登录失败: %v\n", err)
+	}
+
+	return oldCookie, false
+}
+
+// markLoginEnvEpoch 记录"被自动登录替换的 env 指纹"，env 未变化时文件凭据持续接管，
+// 用户更新 env 后指纹变化，env 立即重新生效
+func markLoginEnvEpoch(envCookie, envToken string) {
+	fp := envCredFingerprint(envCookie, envToken)
+	if fp == "" {
+		return
+	}
+	_, _ = lockAndModifyStore(func(s *StoreData) bool {
+		if s.LoginEnvEpoch != fp {
+			s.LoginEnvEpoch = fp
+			return true
+		}
+		return false
+	})
 }
 
 // ======================== 消息推送客户端 ========================
@@ -1020,7 +1344,9 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return nil, fmt.Errorf("解析联通响应失败: %w", err)
+		// 非 JSON 响应（如会话失效时返回裸错误码 "999999" 或登录页 HTML）→ 判定 Cookie 失效，
+		// 触发自动登录自愈而非静默"临时波动"
+		return nil, &AuthError{Msg: fmt.Sprintf("联通接口返回非 JSON 响应 (疑似 Cookie 失效): %v", err)}
 	}
 
 	if data.Code != "0000" {
@@ -2323,11 +2649,29 @@ func main() {
 
 			res, err := fetchAndCalculate(cookie, idx, true, 0)
 			if err != nil {
+				var authErr *AuthError
+				if errors.As(err, &authErr) {
+					// 【自动登录自愈】Cookie 失效时先尝试自动登录换新，成功则用新 Cookie 重试本次巡检
+					fmt.Printf("❌ [%s] Cookie 已失效: %s\n", accTitle, authErr.Msg)
+					fmt.Printf("🔄 [%s] 尝试自动登录换新 Cookie...\n", accTitle)
+					if newCookie, ok := autoRelogin(idx, cookie); ok {
+						if r2, e2 := fetchAndCalculate(newCookie, idx, true, 0); e2 == nil {
+							fmt.Printf("✅ [%s] 自动登录成功，本次巡检已用新 Cookie 恢复。\n", accTitle)
+							res, err = r2, nil
+						} else {
+							fmt.Printf("⚠️ [%s] 已换新 Cookie 但查询仍失败: %v\n", accTitle, e2)
+							err = e2
+						}
+					}
+				}
+			}
+
+			if err != nil {
 				fmt.Printf("❌ [%s] 查询异常: %v\n", accTitle, err)
 
 				var authErr *AuthError
 				if errors.As(err, &authErr) {
-					notifyFault(fmt.Sprintf("[%s] Cookie 已失效: %s", accTitle, authErr.Msg))
+					notifyFault(fmt.Sprintf("[%s] Cookie 已失效且自动登录失败: %s", accTitle, authErr.Msg))
 					failMu.Lock()
 					consecutiveFailures = 0
 					failMu.Unlock()

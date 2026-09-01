@@ -38,6 +38,9 @@
 | 变量名 | 说明 | 必填 | 默认值 / 随机示例 |
 | :--- | :--- | :---: | :--- |
 | `UNICOM_COOKIE` | 联通手机营业厅抓取的完整 Cookie（支持多账号换行） | **是** | `acw_tc=...; c_id=...;` |
+| `ChinaUnicom_10010v4_token_online` | **TokenOnline 自动登录令牌**（联通 APP 抓包 `token_online`，Cookie 失效时自动换新，多账号换行对齐） | 否 | `8d575e92...` |
+| `ChinaUnicom_10010v4_mobile` | 自动登录兜底用的**手机号**（配合服务密码走 RSA 密码登录） | 否 | `156xxxxxxxx` |
+| `ChinaUnicom_10010v4_password` | 自动登录兜底用的**服务密码**（RSA 加密后提交 `login.htm`） | 否 | `******` |
 | `ChinaUnicom_10010v4_min_usage` | **自动通用跳点**报警阈值 (MB)，0 为关闭 | 否 | `50` |
 | `ChinaUnicom_10010v4_min_free_usage` | **自动免流跳点**报警阈值 (MB)，0 为关闭 | 否 | `400` |
 | `ChinaUnicom_10010v4_cooldown` | 通用跳点报警冷却时间（秒） | 否 | `0` (不限制) |
