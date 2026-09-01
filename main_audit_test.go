@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -46,14 +47,15 @@ func TestParseRefreshCallback(t *testing.T) {
 		idx     int
 		matched bool
 	}{
-		{"refresh_0_0", 30, 0, true},  // 旧版 ⚡ → 新语义（botDiffMinutes）
-		{"refresh_30_2", 30, 2, true}, // 新版 ⚡
+		{"refresh_0_0", 0, 0, true},   // ⚡ 实时跳点 = 巡检
+		{"refresh_0_2", 0, 2, true},   // 旧版 ⚡ 同为巡检语义
+		{"refresh_30_2", 30, 2, true}, // 🔍 30分钟跳点
 		{"refresh_-1_1", -1, 1, true}, // 总余量
-		{"refresh_-2_0", 0, 0, true},  // 新版巡检视图回放 → 0
+		{"refresh_-2_0", 0, 0, true},  // 8b207d7 过渡版巡检回放 → 巡检
 		{"refresh_-2_3", 0, 3, true},
-		{"refresh_0", 30, 0, true},    // 旧格式兼容：同样映射到 botDiffMinutes
-		{"refresh_-1", -1, 0, true},   // 旧格式兼容
-		{"refresh_jump", 30, 0, true}, // 旧版实时跳点 → 新语义
+		{"refresh_0", 0, 0, true},    // 旧格式兼容：巡检语义
+		{"refresh_-1", -1, 0, true},  // 旧格式兼容
+		{"refresh_jump", 0, 0, true}, // 最早期版本：巡检语义
 		{"refresh_60", 60, 0, true},
 		{"refresh_abc", 0, 0, false},
 		{"other", 0, 0, false},
@@ -67,92 +69,87 @@ func TestParseRefreshCallback(t *testing.T) {
 	}
 }
 
-// 巡检卡片（/check 0）的刷新键编码为 -2，且解析后能回到 0：
-// 编码若沿用 0，会与历史消息上"旧版 ⚡"的 refresh_0 撞车。
-func TestInspectionCardRefreshRoundtrip(t *testing.T) {
+// 统一静态键盘：所有卡片都是 [⚡ 实时跳点][🔍 N分钟跳点] / [📦 套餐总余量]。
+// ⚡ 编码 refresh_0（巡检），🔍 编码 refresh_<botDiffMinutes>，解析后各归其位。
+func TestInlineKeyboardStaticLayout(t *testing.T) {
 	orig := botDiffMinutes
 	defer func() { botDiffMinutes = orig }()
 	botDiffMinutes = 30
 
-	kb := buildTGInlineKeyboard(0, 0)
+	kb := buildTGInlineKeyboard(1)
 	rows := kb["inline_keyboard"].([][]map[string]string)
-	var refreshKey string
+	if len(rows) != 2 || len(rows[0]) != 2 || len(rows[1]) != 1 {
+		t.Fatalf("期望两行 [2键][1键]，实际 %v", rows)
+	}
+	want := []struct{ text, data string }{
+		{"⚡ 实时跳点", "refresh_0_1"},
+		{"🔍 30分钟跳点", "refresh_30_1"},
+		{"📦 套餐总余量", "refresh_-1_1"},
+	}
+	got := []map[string]string{}
 	for _, row := range rows {
-		for _, k := range row {
-			if k["text"] == "🔄 刷新当前" {
-				refreshKey = k["callback_data"]
-			}
+		got = append(got, row...)
+	}
+	for i, w := range want {
+		if got[i]["text"] != w.text || got[i]["callback_data"] != w.data {
+			t.Errorf("第 %d 键 = %v，期望 %s/%s", i+1, got[i], w.text, w.data)
 		}
 	}
-	if refreshKey != "refresh_-2_0" {
-		t.Fatalf("巡检卡片刷新键 = %q，期望 refresh_-2_0", refreshKey)
-	}
-	min, _, ok := parseRefreshCallback(refreshKey)
-	if !ok || min != 0 {
-		t.Fatalf("refresh_-2_0 解析 => (%d,%v)，期望 (0,true)", min, ok)
-	}
-}
-
-// 键盘内不得出现两个 callback_data 相同的按钮（外观不同、行为一样会让人以为坏了）。
-func TestInlineKeyboardNoDuplicateActions(t *testing.T) {
-	botDiffMinutes = 30
-	for _, diffMin := range []int{-1, 0, 5, 30, 60} {
-		kb := buildTGInlineKeyboard(diffMin, 0)
-		rows := kb["inline_keyboard"].([][]map[string]string)
-		seen := map[string]string{}
-		total := 0
-		for _, row := range rows {
-			if len(row) == 0 {
-				t.Errorf("diffMin=%d 出现空行", diffMin)
-			}
-			for _, k := range row {
-				total++
-				if prev, dup := seen[k["callback_data"]]; dup {
-					t.Errorf("diffMin=%d 重复动作 %s：%q 与 %q", diffMin, k["callback_data"], prev, k["text"])
-				}
-				seen[k["callback_data"]] = k["text"]
-			}
+	// 键与回调语义往返一致
+	for _, w := range want {
+		min, _, ok := parseRefreshCallback(w.data)
+		if !ok {
+			t.Fatalf("%s 解析失败", w.data)
 		}
-		if total < 2 {
-			t.Errorf("diffMin=%d 按钮过少 (%d)", diffMin, total)
-		}
-		// 套餐总余量入口必须始终可达
-		if _, ok := seen["refresh_-1_0"]; !ok {
-			t.Errorf("diffMin=%d 缺少套餐总余量入口", diffMin)
+		wantMin := map[string]int{"refresh_0_1": 0, "refresh_30_1": 30, "refresh_-1_1": -1}[w.data]
+		if min != wantMin {
+			t.Errorf("%s 解析 => %d，期望 %d", w.data, min, wantMin)
 		}
 	}
 }
 
-// diffMin 等于 botDiffMinutes 时，两个同义键合并且沿用 ⚡ 文案。
-func TestInlineKeyboardMergesQuickAndRefresh(t *testing.T) {
-	botDiffMinutes = 30
-	kb := buildTGInlineKeyboard(30, 0)
-	rows := kb["inline_keyboard"].([][]map[string]string)
-	if len(rows) != 1 || len(rows[0]) != 2 {
-		t.Fatalf("期望合并为单行两键，实际 %v", rows)
-	}
-	if rows[0][0]["text"] != "⚡ 实时跳点" || rows[0][0]["callback_data"] != "refresh_30_0" {
-		t.Fatalf("首键应为 ⚡ 实时跳点/refresh_30_0，实际 %v", rows[0][0])
-	}
-}
-
-// ⚡ 快捷键的 callback_data 必须跟随 botDiffMinutes，否则按钮与指令行为分叉。
-func TestInlineKeyboardQuickKeyFollowsBotMinutes(t *testing.T) {
+// 🔍 键的分钟数与 callback_data 必须跟随 botDiffMinutes，否则按钮与指令行为分叉。
+func TestInlineKeyboardJumpKeyFollowsBotMinutes(t *testing.T) {
 	orig := botDiffMinutes
 	defer func() { botDiffMinutes = orig }()
 
 	botDiffMinutes = 45
-	kb := buildTGInlineKeyboard(0, 1)
-	found := ""
-	for _, row := range kb["inline_keyboard"].([][]map[string]string) {
-		for _, k := range row {
-			if k["text"] == "⚡ 实时跳点" {
-				found = k["callback_data"]
+	kb := buildTGInlineKeyboard(1)
+	rows := kb["inline_keyboard"].([][]map[string]string)
+	if rows[0][1]["text"] != "🔍 45分钟跳点" || rows[0][1]["callback_data"] != "refresh_45_1" {
+		t.Fatalf("🔍 键 = %v，期望 🔍 45分钟跳点/refresh_45_1", rows[0][1])
+	}
+	// ⚡ 键不随 botDiffMinutes 变化：永远是巡检
+	if rows[0][0]["text"] != "⚡ 实时跳点" || rows[0][0]["callback_data"] != "refresh_0_1" {
+		t.Fatalf("⚡ 键 = %v，期望 ⚡ 实时跳点/refresh_0_1", rows[0][0])
+	}
+}
+
+// 「🔍 30分钟跳点」样式的文本（底部快捷键盘第二键）跟随标签里的数字。
+func TestJumpLabelTextParsing(t *testing.T) {
+	cases := []struct {
+		in    string
+		min   int
+		match bool
+	}{
+		{"🔍 30分钟跳点", 30, true},
+		{"🔍 60分钟跳点", 60, true},
+		{"🔍  30 分钟跳点", 30, true},
+		{"⚡ 实时跳点", 0, false},
+		{"30分钟", 0, false}, // 由纯数字分支处理，不该撞到这里
+		{"🔍 分钟跳点", 0, false},
+	}
+	for _, c := range cases {
+		m := jumpLabelRe.FindStringSubmatch(c.in)
+		if (m != nil) != c.match {
+			t.Errorf("%q 匹配 => %v，期望 %v", c.in, m != nil, c.match)
+			continue
+		}
+		if m != nil {
+			if n, err := strconv.Atoi(m[1]); err != nil || n != c.min {
+				t.Errorf("%q 解析出 %d，期望 %d", c.in, n, c.min)
 			}
 		}
-	}
-	if found != "refresh_45_1" {
-		t.Fatalf("⚡ 键 callback_data = %q，期望 refresh_45_1", found)
 	}
 }
 

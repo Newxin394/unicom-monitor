@@ -2325,99 +2325,53 @@ func stopDaemon() {
 
 // ======================== 后台 TG 响应协程 ========================
 
-// buildTGInlineKeyboard 构建 TG 内联键盘。
+// jumpLabelRe 匹配底部快捷键盘「🔍 30分钟跳点」样式文本，跟随标签里的数字。
+var jumpLabelRe = regexp.MustCompile(`^🔍\s*(\d+)\s*分钟跳点$`)
+
+// buildTGInlineKeyboard 所有卡片统一的三键静态布局：
 //
-// diffMin 是当前消息所用的对比时长，刷新键据此重放同一种查询，
-// 标签必须与 callback_data 语义一致（否则会出现"标签写 30 分钟、实际跑实时"的错配）。
-// accIdx 编进 callback_data，否则多账号时刷新账号 2 的消息会显示账号 1 的数据。
+//	[⚡ 实时跳点] [🔍 N分钟跳点]
+//	[📦 套餐总余量]
 //
-// 「⚡ 实时跳点」查 botDiffMinutes 分钟，所以在默认时长的卡片上它与刷新键
-// 是同一个查询。这种情况下合并成一个键并沿用「⚡ 实时跳点」文案，
-// 而不是排出两个外观不同、行为完全一样的按钮。
-//
-// 巡检视图（diffMin==0，仅 /check 0 显式触发）的回放键编码为 -2：
-// 旧的 refresh_0 在历史消息上是"旧版 ⚡"的意思（见 parseRefreshCallback
-// 的兼容映射），不能与巡检回放共用同一个编码，否则点旧按钮会查错窗口。
-func buildTGInlineKeyboard(diffMin, accIdx int) map[string]interface{} {
-	const quickLabel = "⚡ 实时跳点"
-	const totalLabel = "📦 套餐总余量"
-	quickData := fmt.Sprintf("refresh_%d_%d", botDiffMinutes, accIdx)
-	totalData := fmt.Sprintf("refresh_-1_%d", accIdx)
-
-	refreshDataMin := diffMin
-	if diffMin == 0 {
-		refreshDataMin = -2
+// ⚡ = 巡检查询（对比上次自动巡检，refresh_0）；🔍 = botDiffMinutes 分钟回溯；
+// 📦 = 总余量。键盘不随卡片内容变化——任何卡片上都能一键跳到任一视图，
+// 点当前视图的键即为刷新。accIdx 编进 callback_data，否则多账号时刷新
+// 账号 2 的消息会显示账号 1 的数据。
+func buildTGInlineKeyboard(accIdx int) map[string]interface{} {
+	return map[string]interface{}{
+		"inline_keyboard": [][]map[string]string{
+			{
+				{"text": "⚡ 实时跳点", "callback_data": fmt.Sprintf("refresh_0_%d", accIdx)},
+				{"text": fmt.Sprintf("🔍 %d分钟跳点", botDiffMinutes), "callback_data": fmt.Sprintf("refresh_%d_%d", botDiffMinutes, accIdx)},
+			},
+			{
+				{"text": "📦 套餐总余量", "callback_data": fmt.Sprintf("refresh_-1_%d", accIdx)},
+			},
+		},
 	}
-	refreshData := fmt.Sprintf("refresh_%d_%d", refreshDataMin, accIdx)
-
-	var refreshLabel string
-	switch {
-	case diffMin == -1:
-		refreshLabel = "🔄 刷新总余量"
-	case diffMin > 0:
-		refreshLabel = fmt.Sprintf("🔄 刷新 (%d分钟)", diffMin)
-	default:
-		// 巡检视图：对比上次自动巡检，标成分钟数会与实际窗口不符
-		refreshLabel = "🔄 刷新当前"
-	}
-
-	keys := []map[string]string{}
-	switch refreshData {
-	case quickData:
-		// 刷新键与快捷键同义 → 只留一个，用用户熟悉的 ⚡ 文案
-		keys = append(keys,
-			map[string]string{"text": quickLabel, "callback_data": quickData},
-			map[string]string{"text": totalLabel, "callback_data": totalData},
-		)
-	case totalData:
-		keys = append(keys,
-			map[string]string{"text": refreshLabel, "callback_data": refreshData},
-			map[string]string{"text": quickLabel, "callback_data": quickData},
-		)
-	default:
-		keys = append(keys,
-			map[string]string{"text": refreshLabel, "callback_data": refreshData},
-			map[string]string{"text": quickLabel, "callback_data": quickData},
-			map[string]string{"text": totalLabel, "callback_data": totalData},
-		)
-	}
-
-	rows := [][]map[string]string{}
-	if len(keys) > 2 {
-		rows = append(rows, keys[:2], keys[2:])
-	} else {
-		rows = append(rows, keys)
-	}
-	return map[string]interface{}{"inline_keyboard": rows}
 }
 
 // parseRefreshCallback 解析 refresh 回调，返回 (对比分钟数, 账号下标, 是否匹配)。
 //
-// 兼容映射：旧版按钮把"对比上次巡检"编码成 refresh_0（当时的 ⚡ 实时跳点
-// 就是这个语义）。⚡ 改为 botDiffMinutes 窗口后，历史消息上的旧按钮不能
-// 继续按旧语义跑——用户看到的标签没变，行为却变了，等于按钮说谎。
-// 所以 refresh_0 统一映射到 botDiffMinutes，点一次旧卡片即收敛到新交互。
-//
-// 新版巡检视图（/check 0）的回放键编码为 -2，映射回 0，不受上面映射影响。
-// 旧格式 refresh_<分钟>（无下标）与 refresh_jump 同样按上述规则处理。
+// 编码：refresh_0 = 巡检查询（⚡ 实时跳点）；refresh_<N> = N 分钟回溯；
+// refresh_-1 = 总余量。旧格式 refresh_<分钟>（无下标）与 refresh_jump
+// （最早期版本）都是巡检语义，直接按 0 处理。
+// refresh_-2 是 8b207d7 过渡版的巡检回放键，同样映射回 0。
 func parseRefreshCallback(data string) (int, int, bool) {
 	if !strings.HasPrefix(data, "refresh_") {
 		return 0, 0, false
 	}
 	body := strings.TrimPrefix(data, "refresh_")
 	if body == "jump" {
-		return botDiffMinutes, 0, true
+		return 0, 0, true
 	}
 	parts := strings.Split(body, "_")
 	min, err := strconv.Atoi(parts[0])
 	if err != nil {
 		return 0, 0, false
 	}
-	if min == 0 {
-		// 旧版 ⚡ / 旧版刷新当前 → 新版 ⚡ 语义
-		min = botDiffMinutes
-	} else if min == -2 {
-		// 新版巡检视图回放
+	if min == -2 {
+		// 8b207d7 过渡版的巡检回放键 → 巡检
 		min = 0
 	}
 	idx := 0
@@ -2447,9 +2401,9 @@ func runTGDaemon() {
 	go func() {
 		payload := map[string]interface{}{
 			"commands": []map[string]string{
-				{"command": "check", "description": fmt.Sprintf("⚡ 实时跳点 (对比 %d 分钟前)", botDiffMinutes)},
+				{"command": "check", "description": "⚡ 实时跳点 (对比上次巡检)"},
 				{"command": "total", "description": "📦 套餐总余量"},
-				{"command": "diff", "description": "🔍 回溯跳点 (可加分钟数，如 /diff 60)"},
+				{"command": "diff", "description": fmt.Sprintf("🔍 跳点回溯 (默认 %d 分钟，如 /diff 60)", botDiffMinutes)},
 				{"command": "help", "description": "💡 帮助与使用指南"},
 			},
 		}
@@ -2695,34 +2649,38 @@ func runTGDaemon() {
 						"chat_id": chatID,
 						"text": "👋 <b>[Go-v4x] 联通监控在线！</b>\n\n" +
 							"💡 <b>菜单功能指南：</b>\n" +
-							fmt.Sprintf("• <b>⚡ 实时跳点</b> (<code>/check</code>) : 对比 <b>%d 分钟</b>前的用量\n", botDiffMinutes) +
+							"• <b>⚡ 实时跳点</b> (<code>/check</code>) : 对比<b>上次自动巡检</b>的实时跳点\n" +
+							fmt.Sprintf("• <b>🔍 %d分钟跳点</b> (<code>/diff</code>) : 对比 <b>%d 分钟前</b>的用量\n", botDiffMinutes, botDiffMinutes) +
 							"• <b>📦 套餐总余量</b> (<code>/total</code>) : 查看当前套餐余量与今日用量\n\n" +
 							"💡 <b>回溯任意时长：</b>\n" +
 							"• <code>/check 60</code>、<code>/diff 30</code> — 对比 N 分钟前的用量\n" +
-							"• 亦可直接发送纯文字，例如 <code>5分钟</code>、<code>60分钟</code>\n" +
-							"• <code>/check 0</code> — 对比<b>上次自动巡检</b>（约 3 分钟窗口）\n" +
-							fmt.Sprintf("• <code>/diff</code> 不带参数同为 %d 分钟（可由 bot_minutes 配置）\n\n", botDiffMinutes) +
+							"• 亦可直接发送纯文字，例如 <code>5分钟</code>、<code>60分钟</code>\n\n" +
 							"👇 点击下方菜单大按钮即可快速查询：",
 						"parse_mode": "HTML",
 						"reply_markup": map[string]interface{}{
 							"keyboard": [][]map[string]string{
-								{{"text": "⚡ 实时跳点"}, {"text": "📦 套餐总余量"}},
+								{{"text": "⚡ 实时跳点"}, {"text": fmt.Sprintf("🔍 %d分钟跳点", botDiffMinutes)}},
+								{{"text": "📦 套餐总余量"}},
 							},
 							"resize_keyboard": true,
 						},
 					})
 				} else if text == "/check" || text == "⚡ 实时跳点" || text == "⚡ 实时查跳点" {
-					// 「⚡ 实时跳点」按钮文案不变，但查的是 botDiffMinutes（默认 30 分钟）：
-					// 对比上次巡检的窗口只有 3 分钟，量太小看不出趋势。
-					// 想要"对比上次巡检"请用 /check 0。
+					// ⚡ = 巡检查询：对比上次自动巡检（约 3 分钟窗口）
 					isQueryCmd = true
-					queryMinutes = botDiffMinutes
+					queryMinutes = 0
 				} else if text == "📦 套餐总余量" || text == "/total" {
 					isQueryCmd = true
 					queryMinutes = -1
 				} else if text == "/diff" || text == "🔍 查询跳点" || text == "查询跳点" {
 					isQueryCmd = true
 					queryMinutes = botDiffMinutes
+				} else if m := jumpLabelRe.FindStringSubmatch(text); m != nil {
+					// 「🔍 30分钟跳点」样式（底部快捷键盘的第二键）：跟随标签里的数字
+					if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
+						isQueryCmd = true
+						queryMinutes = n
+					}
 				} else if strings.HasPrefix(text, "/check") || strings.HasPrefix(text, "/diff") || strings.HasPrefix(text, "/查") {
 					parts := strings.Fields(text)
 					arg := ""
@@ -2808,7 +2766,7 @@ func runTGDaemon() {
 										"chat_id":      cid,
 										"text":         content,
 										"parse_mode":   "HTML",
-										"reply_markup": buildTGInlineKeyboard(qMin, i),
+										"reply_markup": buildTGInlineKeyboard(i),
 									})
 								}
 							}
@@ -2895,7 +2853,7 @@ func runTGDaemon() {
 								"message_id":   msgID,
 								"text":         body,
 								"parse_mode":   "HTML",
-								"reply_markup": buildTGInlineKeyboard(reqMin, idx),
+								"reply_markup": buildTGInlineKeyboard(idx),
 							})
 						}(cookies[accIdx], chatID, cq.Message.MessageID, qMin, accIdx)
 					} else {
@@ -3077,11 +3035,9 @@ func checkAndSendAlert(res *QueryResult, accTitle string) {
 			if tgSend("sendMessage", map[string]interface{}{
 				"chat_id": owner,
 				"text":    finalBotContent,
-				// 自动播报的键盘与其余卡片统一为 [⚡ 实时跳点][📦 套餐总余量]：
-				// 播报内容本身仍是 3 分钟窗口的跳点，但按钮上的"刷新"一律
-				// 跟随实时跳点窗口，不再提供跟着巡检走的刷新键
+				// 自动播报卡片同样挂统一三键键盘，随时可跳转到任一视图
 				"parse_mode":   "HTML",
-				"reply_markup": buildTGInlineKeyboard(botDiffMinutes, res.AccountIndex),
+				"reply_markup": buildTGInlineKeyboard(res.AccountIndex),
 			}) {
 				anySent = true
 			}
