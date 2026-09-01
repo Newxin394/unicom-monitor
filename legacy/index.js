@@ -56,6 +56,54 @@ function getCookies() {
         .filter(c => c.length > 20);
 }
 
+const BUILTIN_QUOTES = [
+    '星光不问赶路人，时光不负有心人。',
+    '生活明朗，万物可爱，人间值得，未来可期。',
+    '不积跬步，无以至千里；不积小流，无以成江海。',
+    '每一个不曾起舞的日子，都是对生命的辜负。',
+    '愿你历尽千帆，归来仍是少年。',
+    '追风赶月莫停留，平芜尽处是春山。',
+    '万物皆有裂痕，那是光照进来的地方。',
+    '保持热爱，奔赴山海。',
+    '知足且上进，温柔且坚定。',
+    '心之所向，素履以往，生如逆旅，一苇以航。',
+    '山有顶峰，湖有彼岸，在人生漫漫长途中，万物皆有回转。',
+    '沉淀自己，默默拔节，终会迎来属于你的繁花似锦。',
+    '日出有盼，日落有念，平淡日子里泛着光。',
+    '慢品人间烟火色，闲观万事岁月长。',
+    '向光而行，不负韶华。',
+    '今天也是元气满满、充满希望的一天！',
+    '行远自迩，笃行不怠。',
+    '岁月漫长，值得等待；心怀浪漫，所遇皆温柔。',
+    '博观而约取，厚积而薄发。',
+    '愿你眼中有星辰，心中有山海，以梦为马，不负韶华。',
+    '无论身在何处，都要像向日葵一样向阳而生。',
+    '前路浩浩荡荡，万事尽可期待。',
+    '热爱可抵岁月漫长，风雨兼程只为遇见更好的自己。',
+    '流水不争先，争的是滔滔不绝。',
+    '路虽远，行则将至；事虽难，做则必成。'
+];
+
+async function getRandomQuote() {
+    const custom = process.env.ChinaUnicom_10010v4_custom_quotes || process.env.CUSTOM_QUOTES;
+    if (custom) {
+        const list = custom.split(/[\n|]+/).map(s => s.trim()).filter(Boolean);
+        if (list.length > 0) return list[Math.floor(Math.random() * list.length)];
+    }
+    if (process.env.ENABLE_ONLINE_QUOTE !== '0') {
+        try {
+            const res = await axios.get('https://v1.hitokoto.cn/?encode=text', {
+                timeout: 1200,
+                headers: { 'User-Agent': 'Mozilla/5.0' }
+            });
+            if (res.data && typeof res.data === 'string' && res.data.trim().length > 0 && res.data.length < 120) {
+                return res.data.trim();
+            }
+        } catch (e) {}
+    }
+    return BUILTIN_QUOTES[Math.floor(Math.random() * BUILTIN_QUOTES.length)];
+}
+
 // 模板变量替换
 function renderTemplate(tpl, vars) {
     let result = (tpl || '').replace(/\\n/g, '\n');
@@ -314,9 +362,14 @@ async function processAccount(cookie, index = 0) {
         '[日期时间]': now.toLocaleString('zh-CN')
     };
 
+    const quote = await getRandomQuote();
+    vars['[随机语录]'] = quote;
+    vars['[一言]'] = quote;
+    vars['[语录]'] = quote;
+
     const defaultTitleTpl = '[套餐]';
     const defaultSubtTpl = '[时长] 跳 [所有通用.用量] 免 [所有免流.用量]';
-    const defaultDescTpl = `☸️通用总共 [通用有限.总] 🔯\n☯️通用已用 [通用有限.已用]🕎\n🕉通用剩余 [通用有限.剩余] ☪️\n♒️免流已用 [所有免流.已用] ⛎\n🕉今日通用 [所有通用.今日用量] 🕉\n🕉今日免流 [所有免流.今日用量] 🕉\n♈️联通时间 [联通时间]♌️`;
+    const defaultDescTpl = `☸️通用总共 [通用有限.总] 🔯\n☯️通用已用 [通用有限.已用]🕎\n🕉通用剩余 [通用有限.剩余] ☪️\n♒️免流已用 [所有免流.已用] ⛎\n🕉今日通用 [所有通用.今日用量] 🕉\n🕉今日免流 [所有免流.今日用量] 🕉\n♈️联通时间 [联通时间]♌️\n💌语录：[随机语录]`;
 
     const titleTpl = process.env.ChinaUnicom_10010v4_title || defaultTitleTpl;
     const subtTpl = process.env.ChinaUnicom_10010v4_subt || defaultSubtTpl;
