@@ -1859,7 +1859,8 @@ func checkAndSendAlert(res *QueryResult, accTitle string) {
 			prefix = "🟢 [免流] "
 		}
 
-		finalAutoTitle := prefix + res.AutoTitle
+		finalAutoTitle := res.AutoTitle
+		finalAutoContent := prefix + res.AutoContent
 		finalBotContent := strings.Replace(
 			res.BotContent,
 			"⚡ <b>联通实时跳点播报</b>",
@@ -1868,7 +1869,7 @@ func checkAndSendAlert(res *QueryResult, accTitle string) {
 		)
 
 		fmt.Printf("🚀 [%s] 触发报警 (%s)，发送通知！\n", accTitle, strings.Join(triggerReasons, " | "))
-		sendDingTalk(finalAutoTitle, res.AutoContent)
+		sendDingTalk(finalAutoTitle, finalAutoContent)
 
 		store := loadStoreSafe()
 		owner := tgUserID
@@ -1886,7 +1887,7 @@ func checkAndSendAlert(res *QueryResult, accTitle string) {
 		}
 
 		if shouldSendDaidaiNotify() {
-			sendDaidaiNotify(finalAutoTitle, res.AutoContent)
+			sendDaidaiNotify(finalAutoTitle, finalAutoContent)
 		}
 	} else if !isNormTriggered && !isFreeTriggered {
 		fmt.Printf("⏳ [%s] 本次通用(+%s / 阈值 %s)与免流(+%s / 阈值 %s)均未达标，静默不扰。\n",
