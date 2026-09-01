@@ -1047,9 +1047,6 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 		}
 
 		effectiveMinutes := diffMinutes
-		if effectiveMinutes == 0 && botDiffMinutes > 0 {
-			effectiveMinutes = botDiffMinutes
-		}
 		if effectiveMinutes < 0 {
 			effectiveMinutes = 0
 		}
