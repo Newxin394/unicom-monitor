@@ -2834,13 +2834,13 @@ func runTGDaemon() {
 							accIdx = 0
 						}
 						multi := len(cookies) > 1
-						go func(c string, cid string, msgID int64, reqMin, idx int) {
+						go func(c string, cid string, reqMin, idx int) {
 							defer atomic.StoreInt32(&isQueryingAtomic, 0)
 							accTitle := fmt.Sprintf("账号 %d", idx+1)
 							res, err := fetchAndCalculate(c, idx, false, reqMin)
 							body := ""
 							if err != nil {
-								// 失败也要给出反馈：否则消息毫无变化，看着像卡死
+								// 失败也要给出反馈：否则看着像卡死
 								body = fmt.Sprintf("❌ [%s] 查询失败: %s", accTitle, html.EscapeString(err.Error()))
 							} else {
 								body = res.BotContent
@@ -2848,14 +2848,15 @@ func runTGDaemon() {
 									body = fmt.Sprintf("👤 <b>[%s]</b>\n%s", accTitle, body)
 								}
 							}
-							tgSend("editMessageText", map[string]interface{}{
+							// 点按钮 = 发一条新消息（不再原地编辑旧卡片），
+							// 每次查询都在对话里留下独立记录，方便回溯对比
+							tgSend("sendMessage", map[string]interface{}{
 								"chat_id":      cid,
-								"message_id":   msgID,
 								"text":         body,
 								"parse_mode":   "HTML",
 								"reply_markup": buildTGInlineKeyboard(idx),
 							})
-						}(cookies[accIdx], chatID, cq.Message.MessageID, qMin, accIdx)
+						}(cookies[accIdx], chatID, qMin, accIdx)
 					} else {
 						atomic.StoreInt32(&isQueryingAtomic, 0)
 					}
