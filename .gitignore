@@ -1,38 +1,29 @@
-# Node & Runtime Logs
-node_modules/
-*.log
-*.tmp
-*.bak
-
-# Runtime Stores & Locks
+# ===== 运行时产物（含真实凭据/状态，绝不入库）=====
 10010v4_cookie.txt
+10010v4_token_online.txt
 10010v4_data.json*
 10010v4x_data.json*
 10010v4x_store.lock
 10010v4x_tg_bot.pid
 
-# Workspace Specific / Non-Repo Files
-sing-box*
-wifi*
-config*
-shortx*
-ebpf*
-*.zip
-*.yaml
-*.txt
-*.cmd
-*.srs
-gen_auto_switch.js
-patch_ebpf_bypass.js
-validate_prep.js
-mkzip.js
-1/
-ARCHIVE.md
-GEMINI.md
+# 热更新暂存二进制（由 10010v4x.sh 原地替换，不属于源码）
+10010v4x.new
 
-# OS Files
+# 本地面板配置（含密钥，防误提交）
+config*.sh
+
+# ===== 日志与临时文件 =====
+*.log
+*.tmp
+*.bak
+
+# ===== 归档与杂项 =====
+*.zip
+*.gz
+*.json
+*.txt
+*.srs
+
+# ===== OS =====
 .DS_Store
 Thumbs.db
-
-auto_wifi_watch.sh
-*.json*
