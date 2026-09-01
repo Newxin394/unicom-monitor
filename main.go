@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
+	"crypto/md5"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -69,6 +71,10 @@ type AccountStore struct {
 	// 通用跳点与免流跳点各自独立的上次推送时间，避免互相压制冷却
 	LastAlertNorm int64 `json:"lastAlertNorm,omitempty"`
 	LastAlertFree int64 `json:"lastAlertFree,omitempty"`
+
+	// 【暴涨防抖】疑似网关脏数据（单次增量异常大）的上次静默时间
+	// 首次暴涨静默一次，若下一次巡检仍暴涨则判定为真实跳点放行
+	LastSuspiciousTime int64 `json:"lastSuspiciousTime,omitempty"`
 }
 
 type StoreData struct {
@@ -89,6 +95,10 @@ type QueryResult struct {
 	AutoContent string
 	BotContent  string
 	AccKey      string
+	// 距上次巡检的分钟数（用于速率感知阈值与通知速率展示）
+	ElapsedMinutes float64
+	// 本次是否为暴涨防抖静默轮（仅记录基线，不推送）
+	SurgeSkipped bool
 }
 
 // ======================== 全局变量与配置 ========================
@@ -117,6 +127,15 @@ var (
 	alertCooldown     time.Duration // 通用跳点冷却
 	freeAlertCooldown time.Duration // 免流跳点冷却
 	faultCooldown     time.Duration // 故障告警冷却
+
+	// 【账期日】联通套餐结算日（默认 1 号），防抖保护在账期日当天放行归零重置
+	billingDay int
+	// 【速率感知】按"3 分钟窗口速率"判定跳点达标的换算阈值
+	rateWindowMinutes float64 = 3
+	// 【暴涨防抖】单次增量超过套餐总量 50% 或超过 1024M 视为疑似脏数据，静默一次
+	surgeThreshold float64 = 1024
+	// 【暴涨确认窗】首次静默后，在此窗口内再次暴涨才判定为真实跳点（秒）
+	surgeConfirmWindow int64 = 600
 
 	isQueryingAtomic  int32
 	lastManualQueryAt int64
@@ -255,6 +274,27 @@ func init() {
 		faultCdSec = 60
 	}
 	faultCooldown = time.Duration(faultCdSec) * time.Second
+
+	// 账期日（默认 1 号），防抖保护在账期日放行归零
+	billingDay, _ = strconv.Atoi(getEnv("ChinaUnicom_10010v4_billing_day", "1"))
+	if billingDay < 1 || billingDay > 31 {
+		billingDay = 1
+	}
+
+	// 速率感知窗口（分钟，默认 3 = 与巡检周期一致）
+	if rw, _ := strconv.ParseFloat(getEnv("ChinaUnicom_10010v4_rate_window_min", "3"), 64); rw > 0 {
+		rateWindowMinutes = rw
+	}
+
+	// 暴涨防抖阈值（MB，默认 1024；0 关闭防抖）
+	if st, _ := strconv.ParseFloat(getEnv("ChinaUnicom_10010v4_surge_threshold_mb", "1024"), 64); st >= 0 {
+		surgeThreshold = st
+	}
+
+	// 暴涨确认窗口（秒，默认 600 = 10 分钟）
+	if sw, _ := strconv.ParseInt(getEnv("ChinaUnicom_10010v4_surge_confirm_sec", "600"), 10, 64); sw > 0 {
+		surgeConfirmWindow = sw
+	}
 }
 
 // ======================== 通用工具函数 ========================
@@ -540,6 +580,27 @@ func getCookies() []string {
 }
 
 // ======================== 消息推送客户端 ========================
+
+// 账号稳定 key：用 Cookie 内容指纹，避免多账号因 Cookie 顺序变化导致基线串号
+func accountKey(cookie string, idx int) string {
+	sum := md5.Sum([]byte(cookie))
+	return "acc_" + hex.EncodeToString(sum[:])[:8]
+}
+
+// 兼容旧版 acc_N 下标 key：同 Cookie 找到旧条目则迁移到指纹 key
+func migrateLegacyAccountKey(store *StoreData, cookie string, idx int) string {
+	key := accountKey(cookie, idx)
+	if _, ok := store.Accounts[key]; ok {
+		return key
+	}
+	legacyKey := fmt.Sprintf("acc_%d", idx)
+	if old, ok := store.Accounts[legacyKey]; ok {
+		store.Accounts[key] = old
+		delete(store.Accounts, legacyKey)
+		fmt.Printf("🔁 [账号 %d] 已迁移旧版存储 key -> %s\n", idx+1, key)
+	}
+	return key
+}
 
 func tgSend(method string, payload map[string]interface{}) bool {
 	if tgBotToken == "" {
@@ -901,22 +962,49 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 	}
 
 	var durationStr = "首次记录"
+	var elapsedMinutes float64
 	var diffNorm, diffNormLimit, diffFree, diffFreeUnlimit, diffFreeLimit float64
 	var todayNorm, todayNormLimit, todayFree, todayFreeUnlimit, todayFreeLimit float64
+	var surgeSkipped bool
 
 	if updateBaseline {
 		// ================= 守卫 3 & 4: 快照与基线只在监控周期写入 (单层锁保护) =================
 		_, lockErr := lockAndModifyStore(func(store *StoreData) bool {
+			accKey = migrateLegacyAccountKey(store, cookie, accountIndex)
 			acc, ok := store.Accounts[accKey]
 			if !ok {
 				acc = &AccountStore{}
 				store.Accounts[accKey] = acc
 			}
 
-			// 【防抖保护】：非 1 号且之前已有正常用量，但接口突发归零，视为网关故障脏数据，拒绝刷乱基线
-			if now.Day() != 1 && acc.Last != nil && acc.Last.NormalUsed > 10 && normUsed == 0 {
+			// 【防抖保护】：非账期日且之前已有正常用量，但接口突发归零，视为网关故障脏数据，拒绝刷乱基线
+			if now.Day() != billingDay && acc.Last != nil && acc.Last.NormalUsed > 10 && normUsed == 0 {
 				fmt.Println("⚠️ [防抖保护] 接口用量突发归零（疑似网关维护），本次放弃覆盖基线。")
 				return false
+			}
+
+			// 【暴涨防抖】：单次增量异常大（疑似网关脏数据/翻倍错乱），首次静默一次不推送
+			// 确认窗口内再次暴涨则判定为真实跳点，放行并清除可疑标记
+			if surgeThreshold > 0 && acc.Last != nil && acc.LastTime > 0 {
+				suspectNorm := normUsed >= acc.Last.NormalUsed && (normUsed-acc.Last.NormalUsed) > surgeThreshold
+				suspectFree := freeUsed >= acc.Last.FreeUsed && (freeUsed-acc.Last.FreeUsed) > surgeThreshold
+				if suspectNorm || suspectFree {
+					if acc.LastSuspiciousTime == 0 || (now.Unix()-acc.LastSuspiciousTime) > surgeConfirmWindow {
+						acc.LastSuspiciousTime = now.Unix()
+						surgeSkipped = true
+						fmt.Printf("⚠️ [暴涨防抖] 检测到疑似异常跳点 (通用+%.0fM / 免流+%.0fM)，本次静默并等待 %d 秒内二次确认。\n",
+							normUsed-acc.Last.NormalUsed, freeUsed-acc.Last.FreeUsed, surgeConfirmWindow)
+						// return true：仅持久化可疑标记并跳过本轮基线/历史更新（静默轮）
+						return true
+					}
+					// 确认窗口内再次暴涨 → 真实跳点
+					fmt.Println("🚨 [暴涨防抖] 确认窗口内再次出现异常跳点，判定为真实跳点，本次放行推送。")
+					acc.LastSuspiciousTime = 0
+				} else if acc.LastSuspiciousTime != 0 {
+					// 恢复平静，清除可疑标记
+					fmt.Println("✅ [暴涨防抖] 用量恢复正常，清除可疑标记。")
+					acc.LastSuspiciousTime = 0
+				}
 			}
 
 			// 守卫 5: ts 严格递增去重写入历史轨迹
@@ -947,8 +1035,8 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 				}
 			}
 
-			// 今日基线处理
-			if acc.Today == nil || acc.TodayDate != todayZero || normUsed < acc.Today.NormalUsed {
+			// 今日基线处理：仅跨天/首次时重置；同一天内用量倒退视为接口抖动，保留原基线
+			if acc.Today == nil || acc.TodayDate != todayZero {
 				acc.Today = currentSnap
 				acc.TodayDate = todayZero
 			}
@@ -978,6 +1066,7 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 			if acc.Last != nil && acc.LastTime > 0 {
 				elapsed := now.Sub(time.UnixMilli(acc.LastTime))
 				durationStr = formatDuration(elapsed)
+				elapsedMinutes = elapsed.Minutes()
 
 				if normUsed >= acc.Last.NormalUsed {
 					diffNorm = normUsed - acc.Last.NormalUsed
@@ -1173,9 +1262,9 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 		"[所有通用.用量]":   formatFlow(diffNorm),
 		"[所有通用.今日用量]": formatFlow(todayNorm),
 
-		"[语音.总]":    fmt.Sprintf("%.0f分钟", voiceTotal),
-		"[语音.已用]":   fmt.Sprintf("%.0f分钟", voiceUsed),
-		"[语音.剩余]":   fmt.Sprintf("%.0f分钟", voiceRemain),
+		"[语音.总]":  fmt.Sprintf("%.0f分钟", voiceTotal),
+		"[语音.已用]": fmt.Sprintf("%.0f分钟", voiceUsed),
+		"[语音.剩余]": fmt.Sprintf("%.0f分钟", voiceRemain),
 
 		"[套餐]":   pkgName,
 		"[时长]":   durationStr,
@@ -1183,6 +1272,16 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 		"[时间]":   now.Format("15:04:05"),
 		"[日期时间]": now.Format("2006-01-02 15:04:05"),
 	}
+
+	// 速率展示（MB/分钟），供 [通用速率]/[免流速率] 占位符使用
+	normRateStr := "—"
+	freeRateStr := "—"
+	if elapsedMinutes > 0 {
+		normRateStr = fmt.Sprintf("%s/分钟", formatFlow(diffNorm/elapsedMinutes))
+		freeRateStr = fmt.Sprintf("%s/分钟", formatFlow(diffFree/elapsedMinutes))
+	}
+	vars["[通用速率]"] = normRateStr
+	vars["[免流速率]"] = freeRateStr
 
 	defaultAutoTitle := "[套餐]"
 	defaultAutoSubt := "[时长] 跳 [所有通用.用量] 免 [所有免流.用量]"
@@ -1251,15 +1350,17 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 	botContent := fmt.Sprintf("%s\n%s", renderTemplate(botTitleTpl, escapedVars), renderTemplate(botDescTpl, escapedVars))
 
 	return &QueryResult{
-		PackageName: pkgName,
-		DurationStr: durationStr,
-		DiffNormal:  diffNorm,
-		DiffFree:    diffFree,
-		TotalDiffMb: totalDiff,
-		AutoTitle:   autoTitle,
-		AutoContent: autoContent,
-		BotContent:  botContent,
-		AccKey:      accKey,
+		PackageName:    pkgName,
+		DurationStr:    durationStr,
+		DiffNormal:     diffNorm,
+		DiffFree:       diffFree,
+		TotalDiffMb:    totalDiff,
+		AutoTitle:      autoTitle,
+		AutoContent:    autoContent,
+		BotContent:     botContent,
+		AccKey:         accKey,
+		ElapsedMinutes: elapsedMinutes,
+		SurgeSkipped:   surgeSkipped,
 	}, nil
 }
 
@@ -1396,8 +1497,10 @@ func runTGDaemon() {
 		cancel()
 		cleanup()
 	}()
-	// 🌟 启动后台自动回环巡检引擎（默认每 3 分钟自动巡检一次，达到阈值主动推钉钉+TG；可由 AUTO_CHECK_INTERVAL_MIN 自定义）
-	loopMin, _ := strconv.Atoi(getEnv("AUTO_CHECK_INTERVAL_MIN", "3"))
+	// 🌟 后台回环巡检引擎（默认关闭，避免与面板 Cron 双循环重复推送）
+	// 推荐由外部 Cron（*/3 分钟）统一驱动巡检与告警；仅当不使用面板 Cron 时才开启此引擎
+	// 可通过 AUTO_CHECK_INTERVAL_MIN 显式开启（如 3）
+	loopMin, _ := strconv.Atoi(getEnv("AUTO_CHECK_INTERVAL_MIN", "0"))
 	if loopMin > 0 {
 		go func() {
 			fmt.Printf("🔄 [Go-v4x] 启动后台回环巡检引擎 (每 %d 分钟巡检一次)\n", loopMin)
@@ -1781,12 +1884,27 @@ func checkAndSendAlert(res *QueryResult, accTitle string) {
 		return
 	}
 
-	// 双独立阈值判定
-	isNormTriggered := minNormUsage > 0 && res.DiffNormal >= minNormUsage
-	isFreeTriggered := minFreeUsage > 0 && res.DiffFree >= minFreeUsage
+	// 【暴涨防抖】静默轮只记录基线、不推送
+	if res.SurgeSkipped {
+		fmt.Printf("⚠️ [%s] 本次为暴涨防抖静默轮，跳过推送。\n", accTitle)
+		return
+	}
+
+	// 双独立阈值判定（增量 + 速率双条件，速率按 rateWindowMinutes 窗口归一）
+	rateNorm := 0.0
+	rateFree := 0.0
+	if res.ElapsedMinutes > 0 {
+		rateNorm = res.DiffNormal / res.ElapsedMinutes * rateWindowMinutes
+		rateFree = res.DiffFree / res.ElapsedMinutes * rateWindowMinutes
+	}
+	isNormTriggered := minNormUsage > 0 && (res.DiffNormal >= minNormUsage || rateNorm >= minNormUsage)
+	isFreeTriggered := minFreeUsage > 0 && (res.DiffFree >= minFreeUsage || rateFree >= minFreeUsage)
 
 	// 越级放行仅针对通用流量
 	isBypass := alertBypassMb > 0 && res.DiffNormal >= alertBypassMb
+
+	// 免流显著加大越级：冷却期内若跳点 ≥ 阈值×3，视为"显著加大"，允许再次推送
+	freeSurgePass := minFreeUsage > 0 && res.DiffFree >= minFreeUsage*3
 
 	var allowSend bool
 	var normPassed, freePassed bool
@@ -1810,6 +1928,9 @@ func checkAndSendAlert(res *QueryResult, accTitle string) {
 				normPassed = true
 				acc.LastAlertNorm = now
 				reason := fmt.Sprintf("通用跳点 +%s >= %s", formatFlow(res.DiffNormal), formatFlow(minNormUsage))
+				if res.DiffNormal < minNormUsage && rateNorm >= minNormUsage {
+					reason = fmt.Sprintf("通用速率 %s ≥ %s/%.0f分", formatFlow(res.DiffNormal/res.ElapsedMinutes), formatFlow(minNormUsage), rateWindowMinutes)
+				}
 				if isBypass {
 					reason += " [越级放行]"
 				}
@@ -1820,12 +1941,18 @@ func checkAndSendAlert(res *QueryResult, accTitle string) {
 			}
 		}
 
-		// 2. 免流跳点判定（独立通道、独立冷却）
+		// 2. 免流跳点判定（独立通道、独立冷却；显著加大可越级）
 		if isFreeTriggered {
-			if freeAlertCooldown <= 0 || acc.LastAlertFree == 0 || (now-acc.LastAlertFree) >= freeAlertCooldown.Milliseconds() {
+			if freeSurgePass || freeAlertCooldown <= 0 || acc.LastAlertFree == 0 || (now-acc.LastAlertFree) >= freeAlertCooldown.Milliseconds() {
 				freePassed = true
 				acc.LastAlertFree = now
-				triggerReasons = append(triggerReasons, fmt.Sprintf("免流跳点 +%s >= %s", formatFlow(res.DiffFree), formatFlow(minFreeUsage)))
+				reason := fmt.Sprintf("免流跳点 +%s >= %s", formatFlow(res.DiffFree), formatFlow(minFreeUsage))
+				if res.DiffFree < minFreeUsage && rateFree >= minFreeUsage {
+					reason = fmt.Sprintf("免流速率 %s ≥ %s/%.0f分", formatFlow(res.DiffFree/res.ElapsedMinutes), formatFlow(minFreeUsage), rateWindowMinutes)
+				} else if freeSurgePass {
+					reason += " [显著加大越级]"
+				}
+				triggerReasons = append(triggerReasons, reason)
 			} else {
 				fmt.Printf("⏳ [%s] 免流跳点已达标 (+%s)，但在免流冷却期内 (%s)，跳过该项推送\n",
 					accTitle, formatFlow(res.DiffFree), cooldownText(freeAlertCooldown))
@@ -1962,32 +2089,62 @@ func main() {
 		fmt.Println("⚠️ [配置] 通用与免流跳点阈值均为 0，报警已关闭（只记录基线、不推送）")
 	}
 
-	// 🌟 多账号支持：依次轮询每个 Cookie
-	for idx, cookie := range cookies {
-		accTitle := fmt.Sprintf("账号 %d", idx+1)
-		fmt.Printf("\n========== 🚀 开始检测 [%s] ==========\n", accTitle)
-
-		res, err := fetchAndCalculate(cookie, idx, true, 0)
-		if err != nil {
-			fmt.Printf("❌ [%s] 查询异常: %v\n", accTitle, err)
-
-			var authErr *AuthError
-			if errors.As(err, &authErr) {
-				notifyFault(fmt.Sprintf("[%s] Cookie 已失效: %s", accTitle, authErr.Msg))
-			} else {
-				fmt.Printf("ℹ️ [%s] 为网络/网关临时波动 (非 Cookie 失效)，保持静默。\n", accTitle)
-			}
-			continue
-		}
-
-		fmt.Println("\n============== 📣 [v4x] 自动报警模版预览 📣 ==============")
-		fmt.Printf("【%s】\n%s\n", res.AutoTitle, res.AutoContent)
-		fmt.Println("==========================================================")
-		fmt.Printf("⏱ 距上次检测: %s | 本次合计跳点: +%s (通用+%s, 免流+%s)\n",
-			res.DurationStr, formatFlow(res.TotalDiffMb), formatFlow(res.DiffNormal), formatFlow(res.DiffFree))
-
-		checkAndSendAlert(res, accTitle)
+	// 🌟 多账号支持：并行轮询每个 Cookie（互不阻塞），并统计连续非认证失败次数
+	// 连续失败（非 Cookie 失效）≥3 次时触发一次故障告警，防真故障无感知
+	var wg sync.WaitGroup
+	var failMu sync.Mutex
+	consecutiveFailures := 0
+	maxConsecutiveFailures, _ := strconv.Atoi(getEnv("ChinaUnicom_10010v4_max_failures", "3"))
+	if maxConsecutiveFailures <= 0 {
+		maxConsecutiveFailures = 3
 	}
+
+	for idx, cookie := range cookies {
+		wg.Add(1)
+		go func(idx int, cookie string) {
+			defer wg.Done()
+			accTitle := fmt.Sprintf("账号 %d", idx+1)
+			fmt.Printf("\n========== 🚀 开始检测 [%s] ==========\n", accTitle)
+
+			res, err := fetchAndCalculate(cookie, idx, true, 0)
+			if err != nil {
+				fmt.Printf("❌ [%s] 查询异常: %v\n", accTitle, err)
+
+				var authErr *AuthError
+				if errors.As(err, &authErr) {
+					notifyFault(fmt.Sprintf("[%s] Cookie 已失效: %s", accTitle, authErr.Msg))
+					failMu.Lock()
+					consecutiveFailures = 0
+					failMu.Unlock()
+				} else {
+					fmt.Printf("ℹ️ [%s] 为网络/网关临时波动 (非 Cookie 失效)，保持静默。\n", accTitle)
+					failMu.Lock()
+					consecutiveFailures++
+					if consecutiveFailures >= maxConsecutiveFailures {
+						notifyFault(fmt.Sprintf("连续 %d 次巡检查询失败（非 Cookie 失效），可能联通接口变更或网络故障", consecutiveFailures))
+						consecutiveFailures = 0
+					}
+					failMu.Unlock()
+				}
+				return
+			}
+
+			// 查询成功即清零连续失败计数
+			failMu.Lock()
+			consecutiveFailures = 0
+			failMu.Unlock()
+
+			fmt.Println("\n============== 📣 [v4x] 自动报警模版预览 📣 ==============")
+			fmt.Printf("【%s】\n%s\n", res.AutoTitle, res.AutoContent)
+			fmt.Println("==========================================================")
+			fmt.Printf("⏱ 距上次检测: %s | 本次合计跳点: +%s (通用+%s, 免流+%s)\n",
+				res.DurationStr, formatFlow(res.TotalDiffMb), formatFlow(res.DiffNormal), formatFlow(res.DiffFree))
+
+			checkAndSendAlert(res, accTitle)
+		}(idx, cookie)
+	}
+
+	wg.Wait()
 
 	os.Exit(0)
 }
