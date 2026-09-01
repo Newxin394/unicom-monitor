@@ -593,10 +593,16 @@ func sendDingTalk(title, content string) bool {
 		return false
 	}
 
+	fullText := fmt.Sprintf("%s\n%s", title, content)
+	ddKeyword := getEnv("ChinaUnicom_10010v4_dd_keyword", getEnv("DD_BOT_KEYWORD", ""))
+	if ddKeyword != "" && !strings.Contains(fullText, ddKeyword) {
+		fullText = fmt.Sprintf("%s: %s", ddKeyword, fullText)
+	}
+
 	body, _ := json.Marshal(map[string]interface{}{
 		"msgtype": "text",
 		"text": map[string]string{
-			"content": fmt.Sprintf("%s\n\n%s", title, content),
+			"content": fullText,
 		},
 	})
 
@@ -1183,7 +1189,7 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 
 	defaultAutoTitle := "[套餐]"
 	defaultAutoSubt := "[时长] 跳 [所有通用.用量] 免 [所有免流.用量]"
-	defaultAutoDesc := "☸️通用总共 [通用有限.总] 🔯\n☯️通用已用 [通用有限.已用]🕎\n🕉通用剩余 [通用有限.剩余] ☪️\n♒️免流已用 [所有免流.已用] ⛎\n🕉今日通用 [所有通用.今日用量] 🕉\n🕉今日免流 [所有免流.今日用量] 🕉\n♈️联通时间 [联通时间]♌️"
+	defaultAutoDesc := "☸️通用总共 [通用有限.总] ✡️\n☯️通用已用 [通用有限.已用]🕎\n🕉️通用剩余 [通用有限.剩余] ☪️\n♒️免流已用 [所有免流.已用] ⛎\n🕉️今日通用 [所有通用.今日用量] 🕉️\n🕉️今日免流 [所有免流.今日用量] 🕉️\n♈️联通时间 [联通时间]♌️"
 
 	autoTitleTpl := getEnv("ChinaUnicom_10010v4_title", defaultAutoTitle)
 	autoSubtTpl := getEnv("ChinaUnicom_10010v4_subt", defaultAutoSubt)
