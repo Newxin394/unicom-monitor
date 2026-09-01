@@ -2042,11 +2042,6 @@ func buildTGInlineKeyboard(diffMin int) map[string]interface{} {
 			{
 				{"text": "📦 套餐总余量", "callback_data": "refresh_-1"},
 			},
-			{
-				{"text": "⏱ 5分钟", "callback_data": "refresh_5"},
-				{"text": "⏱ 10分钟", "callback_data": "refresh_10"},
-				{"text": "⏱ 30分钟", "callback_data": "refresh_30"},
-			},
 		},
 	}
 }
@@ -2264,17 +2259,15 @@ func runTGDaemon() {
 						"text": "👋 <b>[Go-v4x] 联通监控在线！</b>\n\n" +
 							"💡 <b>菜单功能指南：</b>\n" +
 							"• <b>⚡ 实时跳点</b> (<code>/check</code>) : 对比上次自动巡检的实时跳点\n" +
-							"• <b>📦 套餐总余量</b> (<code>/total</code>) : 查看当前套餐余量与今日用量\n" +
-							"• <b>⏱ 5 / 10 / 30 分钟</b> (<code>/diff</code>) : 回溯指定时长对比差值\n\n" +
-							"💡 <b>高级指令：</b>\n" +
-							"• 可随时输入指定分钟数，如 <code>/check 10</code>、<code>/check 30</code>\n" +
-							"• 亦可直接发送纯文字，例如 <code>5分钟</code>、<code>10分钟</code>\n\n" +
+							"• <b>📦 套餐总余量</b> (<code>/total</code>) : 查看当前套餐余量与今日用量\n\n" +
+							"💡 <b>高级指令（回溯任意时长）：</b>\n" +
+							"• 输入指定分钟数，如 <code>/check 10</code>、<code>/check 30</code>\n" +
+							"• 亦可直接发送纯文字，例如 <code>5分钟</code>、<code>60分钟</code>\n\n" +
 							"👇 点击下方菜单大按钮即可快速查询：",
 						"parse_mode": "HTML",
 						"reply_markup": map[string]interface{}{
 							"keyboard": [][]map[string]string{
 								{{"text": "⚡ 实时跳点"}, {"text": "📦 套餐总余量"}},
-								{{"text": "5分钟"}, {"text": "10分钟"}, {"text": "30分钟"}},
 							},
 							"resize_keyboard": true,
 						},
