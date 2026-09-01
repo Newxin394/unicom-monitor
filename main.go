@@ -2416,15 +2416,33 @@ func runTGDaemon() {
 		return
 	}
 
-	// 注册 Telegram 官方菜单指令（须与 /start 帮助文字、内联键盘保持同一套语义）
-	tgSend("setMyCommands", map[string]interface{}{
-		"commands": []map[string]string{
-			{"command": "check", "description": fmt.Sprintf("⚡ 实时跳点 (对比 %d 分钟前)", botDiffMinutes)},
-			{"command": "total", "description": "📦 套餐总余量"},
-			{"command": "diff", "description": "🔍 回溯跳点 (可加分钟数，如 /diff 60)"},
-			{"command": "help", "description": "💡 帮助与使用指南"},
-		},
-	})
+	// 注册 Telegram 官方菜单指令（须与 /start 帮助文字、内联键盘保持同一套语义）。
+	//
+	// 必须重试：这一步只在守护进程启动时跑一次，反代抖动导致的一次 EOF
+	// 会让指令菜单永久停留在上个版本的文案，而日志里只留一行网络异常，
+	// 表现为"指令描述不对"这种看不出根因的故障。
+	go func() {
+		payload := map[string]interface{}{
+			"commands": []map[string]string{
+				{"command": "check", "description": fmt.Sprintf("⚡ 实时跳点 (对比 %d 分钟前)", botDiffMinutes)},
+				{"command": "total", "description": "📦 套餐总余量"},
+				{"command": "diff", "description": "🔍 回溯跳点 (可加分钟数，如 /diff 60)"},
+				{"command": "help", "description": "💡 帮助与使用指南"},
+			},
+		}
+		for attempt := 1; attempt <= 5; attempt++ {
+			if tgSend("setMyCommands", payload) {
+				if attempt > 1 {
+					fmt.Printf("✅ [TG] 指令菜单注册成功 (第 %d 次尝试)\n", attempt)
+				}
+				return
+			}
+			if attempt < 5 {
+				time.Sleep(time.Duration(attempt*3) * time.Second)
+			}
+		}
+		fmt.Println("⚠️ [TG] 指令菜单注册连续 5 次失败，菜单可能仍是旧文案（不影响指令本身可用）")
+	}()
 
 	cleanup := func() {
 		if readPidFile() == os.Getpid() {
@@ -2659,7 +2677,7 @@ func runTGDaemon() {
 							"💡 <b>回溯任意时长：</b>\n" +
 							"• <code>/check 60</code>、<code>/diff 30</code> — 对比 N 分钟前的用量\n" +
 							"• 亦可直接发送纯文字，例如 <code>5分钟</code>、<code>60分钟</code>\n" +
-							fmt.Sprintf("• <code>/check 0</code> — 对比<b>上次自动巡检</b>（约 3 分钟窗口）\n") +
+							"• <code>/check 0</code> — 对比<b>上次自动巡检</b>（约 3 分钟窗口）\n" +
 							fmt.Sprintf("• <code>/diff</code> 不带参数同为 %d 分钟（可由 bot_minutes 配置）\n\n", botDiffMinutes) +
 							"👇 点击下方菜单大按钮即可快速查询：",
 						"parse_mode": "HTML",
