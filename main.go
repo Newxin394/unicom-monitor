@@ -1074,23 +1074,64 @@ func markLoginEnvEpoch(envCookie, envToken string) {
 
 // ======================== 消息推送客户端 ========================
 
-// 账号稳定 key：用 Cookie 内容指纹，避免多账号因 Cookie 顺序变化导致基线串号
+// 从 Cookie 中提取手机号（c_mobile / u_account），作为跨 Cookie 轮换稳定的账号身份
+var cookieMobileRe = regexp.MustCompile(`(?:c_mobile|u_account)=(\d{11})`)
+
+func mobileFromCookie(cookie string) string {
+	if m := cookieMobileRe.FindStringSubmatch(cookie); len(m) == 2 {
+		return m[1]
+	}
+	return ""
+}
+
+// 账号稳定 key：优先用 Cookie 内的手机号指纹。
+// 手机号在自动登录换新 Cookie 后保持不变，基线与历史不会因换 Cookie 而丢失；
+// 取不到手机号时回落到 Cookie 全文指纹（旧行为）。
 func accountKey(cookie string, idx int) string {
+	if mobile := mobileFromCookie(cookie); mobile != "" {
+		sum := md5.Sum([]byte("mobile:" + mobile))
+		return "acc_" + hex.EncodeToString(sum[:])[:8]
+	}
+	return legacyCookieKey(cookie)
+}
+
+// legacyCookieKey 旧版账号 key：Cookie 全文指纹（换 Cookie 即漂移，仅用于迁移）
+func legacyCookieKey(cookie string) string {
 	sum := md5.Sum([]byte(cookie))
 	return "acc_" + hex.EncodeToString(sum[:])[:8]
 }
 
-// 兼容旧版 acc_N 下标 key：同 Cookie 找到旧条目则迁移到指纹 key
+// 兼容旧 key：从 Cookie 全文指纹 key 或 acc_N 下标 key 迁移到手机号 key。
+// 多个旧条目同时存在时（如换 Cookie 产生的漂移副本）取历史最丰富的一条，
+// 避免把刚建立的空基线当成账号真身。
 func migrateLegacyAccountKey(store *StoreData, cookie string, idx int) string {
 	key := accountKey(cookie, idx)
 	if _, ok := store.Accounts[key]; ok {
 		return key
 	}
-	legacyKey := fmt.Sprintf("acc_%d", idx)
-	if old, ok := store.Accounts[legacyKey]; ok {
-		store.Accounts[key] = old
-		delete(store.Accounts, legacyKey)
-		fmt.Printf("🔁 [账号 %d] 已迁移旧版存储 key -> %s\n", idx+1, key)
+
+	candidates := []string{legacyCookieKey(cookie), fmt.Sprintf("acc_%d", idx)}
+	bestKey := ""
+	var best *AccountStore
+	for _, ck := range candidates {
+		if ck == key {
+			continue
+		}
+		old, ok := store.Accounts[ck]
+		if !ok || old == nil {
+			continue
+		}
+		if best == nil || len(old.History) > len(best.History) ||
+			(len(old.History) == len(best.History) && old.LastTime > best.LastTime) {
+			best, bestKey = old, ck
+		}
+	}
+
+	if best != nil {
+		store.Accounts[key] = best
+		delete(store.Accounts, bestKey)
+		fmt.Printf("🔁 [账号 %d] 已迁移旧版存储 key %s -> %s (保留 %d 条历史)\n",
+			idx+1, bestKey, key, len(best.History))
 	}
 	return key
 }
@@ -1469,7 +1510,9 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 
 	now := time.Now().In(cst)
 	todayZero := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, cst).UnixMilli()
-	accKey := fmt.Sprintf("acc_%d", accountIndex)
+	// 账号 key 必须与监控周期写入时一致，否则主动查询（TG 按钮）会读到空基线，
+	// 导致"今日用量恒为 0"与"永远首次记录"
+	accKey := accountKey(cookie, accountIndex)
 
 	currentSnap := &UsageSnapshot{
 		FreeUnlimitedUsed: freeUnlimitUsed,
@@ -1634,6 +1677,16 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 		store := loadStoreSafe()
 		acc, ok := store.Accounts[accKey]
 		if !ok || acc == nil {
+			// 只读兜底：手机号 key 尚未落盘时（首个监控周期还没跑），
+			// 回退查旧的 Cookie 指纹 / 下标 key，避免主动查询显示空基线
+			for _, fk := range []string{legacyCookieKey(cookie), fmt.Sprintf("acc_%d", accountIndex)} {
+				if old, found := store.Accounts[fk]; found && old != nil {
+					acc = old
+					break
+				}
+			}
+		}
+		if acc == nil {
 			acc = &AccountStore{}
 		}
 
