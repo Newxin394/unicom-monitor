@@ -88,6 +88,12 @@ type AccountStore struct {
 	// 【暴涨防抖】疑似网关脏数据（单次增量异常大）的上次静默时间
 	// 首次暴涨静默一次，若下一次巡检仍暴涨则判定为真实跳点放行
 	LastSuspiciousTime int64 `json:"lastSuspiciousTime,omitempty"`
+
+	// 【故障计数】连续非认证失败次数，必须持久化：巡检由 cron 每 3 分钟拉起独立进程，
+	// 进程内计数器每次都从 0 开始，"连续 N 次失败"告警永远无法触发。
+	// FailStreakAt 记录最后一次失败时间，用于超时后自动重置（避免跨天累积误报）。
+	FailStreak   int   `json:"failStreak,omitempty"`
+	FailStreakAt int64 `json:"failStreakAt,omitempty"`
 }
 
 type StoreData struct {
@@ -96,14 +102,29 @@ type StoreData struct {
 	TGOffset         int64                    `json:"tgOffset"`
 	LastFaultAlertAt int64                    `json:"lastFaultAlertAt"`
 	Cookies          []string                 `json:"cookies,omitempty"`
-	// 【自动登录】上次自动登录成功时被替换的 env 配置指纹（cookie+token_online 组合 md5）。
-	// 当 env 配置与该指纹一致时视为"env 已过期"，自动登录产生的新凭据优先；
-	// 用户修改 env（指纹变化）后 env 立即重新接管。
+
+	// 【自动登录】按手机号索引的凭据表，是轮换后凭据的唯一权威来源。
+	// 用 map 而非按行数组：换新 Cookie 后手机号不变，既不会因行号错位串号，
+	// 又天然与 flock 临界区共享同一份 JSON，避免独立文件的锁外读改写竞态。
+	Creds map[string]*Credential `json:"creds,omitempty"`
+
+	// 旧版全局 epoch 指纹，仅用于从"整段 env 指纹"版本升级时迁移，之后不再参与判定
 	LoginEnvEpoch string `json:"loginEnvEpoch,omitempty"`
 }
 
+// Credential 单账号的自动登录凭据。
+// EnvEpoch 记录"本条凭据当初替换掉的那行 env 配置的指纹"：
+// env 行未变时文件凭据持续接管，用户改了 env 行（指纹变化）则 env 立即重新生效。
+// 指纹按行计算，因此修改某一个账号的 env 不会击穿其它账号。
+type Credential struct {
+	Mobile      string `json:"mobile,omitempty"`
+	Cookie      string `json:"cookie,omitempty"`
+	TokenOnline string `json:"tokenOnline,omitempty"`
+	EnvEpoch    string `json:"envEpoch,omitempty"`
+	UpdatedAt   int64  `json:"updatedAt,omitempty"`
+}
+
 type QueryResult struct {
-	PackageName string
 	DurationStr string
 	DiffNormal  float64
 	DiffFree    float64
@@ -112,6 +133,8 @@ type QueryResult struct {
 	AutoContent string
 	BotContent  string
 	AccKey      string
+	// 账号下标，供报警消息的内联键盘编码"刷新哪个账号"
+	AccountIndex int
 	// 距上次巡检的分钟数（用于速率感知阈值与通知速率展示）
 	ElapsedMinutes float64
 	// 本次是否为暴涨防抖静默轮（仅记录基线，不推送）
@@ -143,7 +166,7 @@ var (
 	minNormUsage float64 // 通用流量跳点阈值，默认 50M
 	minFreeUsage float64 // 免流流量跳点阈值，默认 400M
 
-	botDiffMinutes    int           // 机器人主动查询默认对比时长（分钟），默认 0（对比上次自动巡检）
+	botDiffMinutes    int           // /diff 不带参数时的回溯时长（分钟），默认 30；不影响键盘按钮
 	alertBypassMb     float64       // 通用跳点超此值时无视冷却
 	alertCooldown     time.Duration // 通用跳点冷却
 	freeAlertCooldown time.Duration // 免流跳点冷却
@@ -208,9 +231,13 @@ func init() {
 	// 1. 优先使用面板显式注入的脚本根目录（呆呆面板 DAIDAI_SCRIPTS_DIR、青龙 QL_DIR 等）
 	// 2. 识别并规避 `go run` 产生的临时缓存目录 (/tmp/go-build*)
 	// 3. 回退到真实可执行文件所在目录或当前工作目录
-	if envDir := getEnv("DAIDAI_SCRIPTS_DIR", ""); envDir != "" {
+	//
+	// 这两个引导变量必须用 os.Getenv 直读：getEnv 会触发 config.sh 的 sync.Once 加载，
+	// 而 config.sh 的候选路径依赖 scriptDir——此刻 scriptDir 尚未赋值，
+	// 一旦提前消费 Once，"脚本目录/config.sh" 将永久退化为相对 CWD 的路径且无法重建。
+	if envDir := strings.TrimSpace(os.Getenv("DAIDAI_SCRIPTS_DIR")); envDir != "" {
 		scriptDir = envDir
-	} else if qlDir := getEnv("QL_DIR", ""); qlDir != "" {
+	} else if qlDir := strings.TrimSpace(os.Getenv("QL_DIR")); qlDir != "" {
 		scriptDir = filepath.Join(qlDir, "data", "scripts")
 		if _, err := os.Stat(scriptDir); err != nil {
 			scriptDir = filepath.Join(qlDir, "scripts")
@@ -243,10 +270,15 @@ func init() {
 	cookieFile = filepath.Join(scriptDir, "10010v4_cookie.txt")
 	tokenOnlineFile = filepath.Join(scriptDir, "10010v4_token_online.txt")
 
-	// 清理历史崩溃遗留的 .tmp 中间文件
+	// 清理历史崩溃遗留的 .tmp 中间文件。
+	// 只删 5 分钟前的：cron 巡检进程与 daemon 并存，无条件删会抢掉
+	// 对方刚写完、还没 rename 的临时文件，导致那次写入失败。
 	if matches, _ := filepath.Glob(dataFile + ".*.tmp"); len(matches) > 0 {
+		staleBefore := time.Now().Add(-5 * time.Minute)
 		for _, p := range matches {
-			_ = os.Remove(p)
+			if fi, err := os.Stat(p); err == nil && fi.ModTime().Before(staleBefore) {
+				_ = os.Remove(p)
+			}
 		}
 	}
 
@@ -269,7 +301,8 @@ func init() {
 		minFreeUsage = 400
 	}
 
-	// 机器人默认独立对比时长（分钟），默认 30 分钟
+	// /diff 不带参数时的回溯时长（分钟），默认 30。填 0 或负数视为未配置、回落 30；
+	// "对比上次巡检"请用 /check，不要靠这里填 0
 	bMin, _ := strconv.Atoi(getEnv("ChinaUnicom_10010v4_bot_minutes", "30"))
 	if bMin <= 0 {
 		bMin = 30
@@ -296,8 +329,12 @@ func init() {
 	alertCooldown = time.Duration(alertCdSec) * time.Second
 
 	// 免流跳点冷却，默认 1800 秒（30分钟）
-	freeCdSec, _ := strconv.Atoi(getEnv("ChinaUnicom_10010v4_free_cooldown", "1800"))
-	if freeCdSec < 0 {
+	// 解析失败（env 写错，如 "30min"）必须回落默认值：静默取 0 会让冷却失效，
+	// 免流跳点每轮巡检都推送，等于把配置笔误变成通知风暴
+	freeCdSec, freeCdErr := strconv.Atoi(getEnv("ChinaUnicom_10010v4_free_cooldown", "1800"))
+	if freeCdErr != nil {
+		freeCdSec = 1800
+	} else if freeCdSec < 0 {
 		freeCdSec = 0
 	}
 	freeAlertCooldown = time.Duration(freeCdSec) * time.Second
@@ -320,7 +357,9 @@ func init() {
 	}
 
 	// 暴涨防抖阈值（MB，默认 1024；0 关闭防抖）
-	if st, _ := strconv.ParseFloat(getEnv("ChinaUnicom_10010v4_surge_threshold_mb", "1024"), 64); st >= 0 {
+	// 必须校验 err：解析失败时 ParseFloat 返回 0，而 0 恰好满足 >= 0，
+	// 会把"env 写错"静默变成"关闭防抖"这一功能性降级
+	if st, err := strconv.ParseFloat(getEnv("ChinaUnicom_10010v4_surge_threshold_mb", "1024"), 64); err == nil && st >= 0 {
 		surgeThreshold = st
 	}
 
@@ -525,26 +564,41 @@ func getRandomQuote() string {
 	return builtinQuotes[r.Intn(len(builtinQuotes))]
 }
 
-// 占位符按长度降序替换，防止 [所有通用.用量] 被 [所有通用.用] 短键截胡
+// renderTemplate 单遍扫描替换占位符。
+//
+// 两条约束决定了这个实现：
+//   - 按长度降序匹配，防止 [所有通用.用量] 被 [所有通用.用] 短键截胡
+//   - 单遍扫描（而非逐键 ReplaceAll 多遍），已替换进来的值不再参与后续匹配。
+//     多遍替换下，套餐名等接口字段里只要出现形似占位符的文本，就会被二次替换。
 func renderTemplate(tpl string, vars map[string]string) string {
-	res := strings.ReplaceAll(tpl, "\\n", "\n")
+	src := strings.ReplaceAll(tpl, "\\n", "\n")
 
-	type kv struct {
-		k string
-		v string
+	keys := make([]string, 0, len(vars))
+	for k := range vars {
+		if k != "" {
+			keys = append(keys, k)
+		}
 	}
-	pairs := make([]kv, 0, len(vars))
-	for k, v := range vars {
-		pairs = append(pairs, kv{k, v})
-	}
-	sort.Slice(pairs, func(i, j int) bool {
-		return len(pairs[i].k) > len(pairs[j].k)
-	})
+	sort.Slice(keys, func(i, j int) bool { return len(keys[i]) > len(keys[j]) })
 
-	for _, p := range pairs {
-		res = strings.ReplaceAll(res, p.k, p.v)
+	var b strings.Builder
+	b.Grow(len(src))
+	for i := 0; i < len(src); {
+		matched := false
+		for _, k := range keys {
+			if strings.HasPrefix(src[i:], k) {
+				b.WriteString(vars[k])
+				i += len(k)
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			b.WriteByte(src[i])
+			i++
+		}
 	}
-	return res
+	return b.String()
 }
 
 func toFloat(v interface{}) float64 {
@@ -628,6 +682,43 @@ func lastSnapshotBeforeMs(history []SnapshotRecord, ts int64) int {
 
 // ======================== 容灾存储引擎 ========================
 
+// writeFileAtomic 断电安全的原子写：写临时文件 → fsync 数据 → rename → fsync 目录项。
+//
+// 两次 Sync 都不可省。POSIX 对"rename 返回后新文件内容已在盘上"零保证：
+// 数据块可以晚于目录项提交。路由器闪存断电时，只做 tmp+rename 会留下
+// 长度正确但内容全零/截断的 JSON——主数据与 .bak 可同时损毁，历史基线全灭。
+func writeFileAtomic(path string, raw []byte, perm os.FileMode) error {
+	tmp := fmt.Sprintf("%s.%d.%d.tmp", path, os.Getpid(), time.Now().UnixNano())
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(raw); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	// rename 本身也需要持久化，否则断电后可能回到 rename 之前的状态
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
+}
+
 // 抢排他锁 → 读 → 改 → 原子落盘。updater 返回 false 表示无需写盘。
 func lockAndModifyStore(updater func(*StoreData) bool) (*StoreData, error) {
 	f, err := os.OpenFile(lockFile, os.O_CREATE|os.O_RDWR, 0666)
@@ -653,34 +744,33 @@ func lockAndModifyStore(updater func(*StoreData) bool) (*StoreData, error) {
 	}
 	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 
-	store := loadStoreSafe()
+	store, loadErr := loadStore()
+	if loadErr != nil {
+		// 读 IO 错误（EIO/权限等）下无法判断主数据死活，本轮绝不写盘：
+		// 否则会把 .bak 的旧快照覆盖到可能完好的主文件上
+		return nil, fmt.Errorf("主数据读取失败，本轮拒绝写盘: %w", loadErr)
+	}
 
 	if !updater(store) {
 		return store, nil
 	}
 
-	tmpFile := fmt.Sprintf("%s.%d.%d.tmp", dataFile, os.Getpid(), time.Now().UnixNano())
 	raw, err := json.MarshalIndent(store, "", "  ")
 	if err != nil {
 		return nil, err
 	}
 
-	if err := os.WriteFile(tmpFile, raw, 0644); err != nil {
-		return nil, err
-	}
-
-	// 只在主数据本身健康时才刷新 .bak
+	// 只在主数据本身健康时才刷新 .bak（避免用坏数据备份坏数据）
 	if storeMainHealthy.Load() {
 		if oldRaw, err := os.ReadFile(dataFile); err == nil {
 			var check StoreData
 			if json.Unmarshal(oldRaw, &check) == nil && check.Accounts != nil {
-				_ = os.WriteFile(bakFile, oldRaw, 0644)
+				_ = writeFileAtomic(bakFile, oldRaw, 0644)
 			}
 		}
 	}
 
-	if err := os.Rename(tmpFile, dataFile); err != nil {
-		_ = os.Remove(tmpFile)
+	if err := writeFileAtomic(dataFile, raw, 0644); err != nil {
 		return nil, err
 	}
 	storeMainHealthy.Store(true)
@@ -688,19 +778,34 @@ func lockAndModifyStore(updater func(*StoreData) bool) (*StoreData, error) {
 	return store, nil
 }
 
-func loadStoreSafe() *StoreData {
+// loadStore 读取主数据，区分三种结果：
+//   - (store, nil)：读取成功，或首次运行（文件不存在）
+//   - (store, nil) 且 storeMainHealthy=false：读成功但 JSON 损坏，已从 .bak 找回
+//   - (nil, err)：读 IO 错误，主数据死活未知——调用方必须拒绝写盘
+//
+// 把"读失败"和"JSON 损坏"分开是关键：只有确凿损坏才允许回退 .bak，
+// 否则一次闪存读抖动就会让 .bak 的旧数据覆盖健康的主文件。
+func loadStore() (*StoreData, error) {
 	store := &StoreData{Accounts: make(map[string]*AccountStore)}
 	storeMainHealthy.Store(true)
 
-	if raw, err := os.ReadFile(dataFile); err == nil {
-		if json.Unmarshal(raw, store) == nil {
-			if store.Accounts == nil {
-				store.Accounts = make(map[string]*AccountStore)
-			}
-			return store
+	raw, readErr := os.ReadFile(dataFile)
+	if readErr != nil {
+		if os.IsNotExist(readErr) {
+			// 首次运行：主数据尚未生成，不是损坏
+			return store, nil
 		}
+		return nil, readErr
 	}
 
+	if json.Unmarshal(raw, store) == nil {
+		if store.Accounts == nil {
+			store.Accounts = make(map[string]*AccountStore)
+		}
+		return store, nil
+	}
+
+	// 读成功但解析失败 = 确凿损坏，回退 .bak
 	storeMainHealthy.Store(false)
 	fmt.Println("⚠️ [存储] 主数据损坏，尝试用 .bak 恢复...")
 
@@ -711,61 +816,91 @@ func loadStoreSafe() *StoreData {
 				store.Accounts = make(map[string]*AccountStore)
 			}
 			fmt.Println("✅ [存储] 已从 .bak 找回基线数据")
-			return store
+			return store, nil
 		}
 	}
 
+	return store, nil
+}
+
+// loadStoreSafe 是只读调用方的便捷包装：读 IO 错误时返回空 store 而非报错。
+// 只用于展示与判断，绝不能把它的结果写回磁盘（写路径必须走 loadStore）。
+func loadStoreSafe() *StoreData {
+	store, err := loadStore()
+	if err != nil || store == nil {
+		return &StoreData{Accounts: make(map[string]*AccountStore)}
+	}
 	return store
 }
 
-// 只按换行拆分 Cookie，绝不按 & 拆（Cookie 内部本身就含 &）
+// getCookies 返回本轮要巡检的 Cookie 列表（顺序即账号顺序）。
+//
+// 凭据来源与优先级（逐行独立判定，不是整段一刀切）：
+//  1. env 行（UNICOM_COOKIE / ChinaUnicom_10010v4_cookie，按换行分账号）
+//  2. 若该行对应的手机号在 store.Creds 中已有轮换凭据，且那条凭据记录的
+//     EnvEpoch 与当前 env 行指纹一致（= env 行没被用户改过），则用轮换后的新 Cookie
+//  3. env 为空时回落 cookieFile，再回落 store.Cookies
+//
+// 逐行判定是关键：修改某一个账号的 env 行只会让该行回到 env 控制，
+// 其余账号仍继续使用各自已轮换的新凭据。
 func getCookies() []string {
 	envCookie := getEnv("UNICOM_COOKIE", getEnv("ChinaUnicom_10010v4_cookie", ""))
-	fileCookie := ""
-	if data, err := os.ReadFile(cookieFile); err == nil {
-		fileCookie = strings.TrimSpace(string(data))
-	}
+	envToks := splitCookieLines(getEnv("ChinaUnicom_10010v4_token_online", ""))
 
-	cookieStr := envCookie
-	// 【自动登录接管】env 配置与"上次被自动登录替换的指纹"一致 → env 已过期，用轮换后的文件凭据
-	if envCookie != "" && fileCookie != "" {
-		st := loadStoreSafe()
-		if st != nil && st.LoginEnvEpoch != "" && st.LoginEnvEpoch == envCredFingerprint(envCookie, getEnv("ChinaUnicom_10010v4_token_online", "")) {
-			cookieStr = fileCookie
-			fmt.Println("🔓 [自动登录] env Cookie 已被自动登录轮换接管，使用文件中的新凭据")
+	list := splitCookieLines(envCookie)
+	if len(list) == 0 {
+		// env 未配置：回落文件，再回落 store（独立 daemon 进程在空 env 下依然可用）
+		if data, err := os.ReadFile(cookieFile); err == nil {
+			list = splitCookieLines(string(data))
 		}
-	}
-	if cookieStr == "" {
-		cookieStr = fileCookie
-	}
-	if cookieStr == "" {
-		// 从持久化存储兜底读取，确保独立 daemon 进程在空 env 下依然可用
-		st := loadStoreSafe()
-		if st != nil && len(st.Cookies) > 0 {
-			return st.Cookies
-		}
-		return nil
-	}
-
-	var list []string
-	for _, l := range strings.Split(cookieStr, "\n") {
-		trimmed := strings.TrimSpace(strings.Trim(l, "\r`"))
-		if len(trimmed) > 20 {
-			list = append(list, trimmed)
-		}
-	}
-
-	// 自动持久化落盘，确保守护进程跨进程共享 Cookie
-	if len(list) > 0 {
-		_ = os.WriteFile(cookieFile, []byte(strings.Join(list, "\n")), 0600)
-		_, _ = lockAndModifyStore(func(s *StoreData) bool {
-			if len(s.Cookies) != len(list) {
-				s.Cookies = list
-				return true
+		if len(list) == 0 {
+			if st := loadStoreSafe(); st != nil && len(st.Cookies) > 0 {
+				return st.Cookies
 			}
-			return false
-		})
+			return nil
+		}
+		return list
 	}
+
+	// env 有配置：逐行检查是否已被自动登录接管
+	st := loadStoreSafe()
+	if st != nil && len(st.Creds) > 0 {
+		takenOver := 0
+		for i, ck := range list {
+			mobile := mobileFromCookie(ck)
+			if mobile == "" {
+				continue
+			}
+			cred := st.Creds[mobile]
+			if cred == nil || cred.Cookie == "" {
+				continue
+			}
+			envTok := ""
+			if i < len(envToks) {
+				envTok = envToks[i]
+			}
+			if cred.EnvEpoch != "" && cred.EnvEpoch == envCredFingerprint(ck, envTok) {
+				list[i] = cred.Cookie
+				takenOver++
+			}
+		}
+		if takenOver > 0 {
+			fmt.Printf("🔓 [自动登录] %d 个账号的 env Cookie 已被轮换接管，使用 store 中的新凭据\n", takenOver)
+		}
+	}
+
+	// 落盘一份供独立进程兜底（内容变化才写，避免无意义 IO 与闪存磨损）
+	joined := strings.Join(list, "\n")
+	if old, err := os.ReadFile(cookieFile); err != nil || strings.TrimSpace(string(old)) != joined {
+		_ = writeFileAtomic(cookieFile, []byte(joined), 0600)
+	}
+	_, _ = lockAndModifyStore(func(s *StoreData) bool {
+		if strings.Join(s.Cookies, "\n") != joined {
+			s.Cookies = append([]string(nil), list...)
+			return true
+		}
+		return false
+	})
 
 	return list
 }
@@ -784,31 +919,114 @@ const (
 // 联通手厅登录 RSA 公钥 (PKCS#1 v1.5, 与 JSEncrypt 兼容)
 const unicomPubKeyB64 = "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDc+CZK9bBA9IU+gZUOc6FUGu7yO9WpTNB0PzmgFBh96Mg1WrovD1oqZ+eIF4LjvxKXGOdI79JRdve9NPhQo07+uqGQgE4imwNnRx7PFtCRryiIEcUoavuNtuRVoBAm6qdB0SrctgaqGfLgKvZHOnwTjyNqjBUxzMeQlEC2czEMSwIDAQAB"
 
-// envCredFingerprint 生成 env 凭据指纹（cookie+token_online 组合 md5 前 16 位）
-// 用于判断"env 配置是否仍是上次被自动登录替换的那份旧值"
+// envCredFingerprint 生成单行 env 凭据指纹（该行 cookie + 该行 token_online 的 md5 前 16 位）。
+// 按行计算是刻意的：只改一个账号的 env 行时，其余账号的指纹不变、轮换凭据继续生效。
 func envCredFingerprint(cookie, tokenOnline string) string {
-	sum := md5.Sum([]byte(cookie + "|" + tokenOnline))
+	sum := md5.Sum([]byte(strings.TrimSpace(cookie) + "|" + strings.TrimSpace(tokenOnline)))
 	return hex.EncodeToString(sum[:])[:16]
 }
 
-// getTokenOnlines 读取 token_online 列表（按行，与账号一一对应）。
-// 优先级: 文件(服务器轮换后的最新值) > 环境变量 ChinaUnicom_10010v4_token_online
-func getTokenOnlines() []string {
-	fileToks := readLinesFile(tokenOnlineFile)
-	envTok := strings.TrimSpace(getEnv("ChinaUnicom_10010v4_token_online", ""))
-	if envTok == "" {
-		return fileToks
+// tokenOnlineForAccount 取第 idx 个账号（手机号 mobile）当前应使用的 token_online。
+//
+// 与 Cookie 同一套逐行接管规则：store.Creds 里该手机号的凭据若记录了
+// 与当前 env 第 idx 行一致的 EnvEpoch，说明 env 行尚未被用户更新，用轮换后的新 token；
+// 否则用 env 行本身。行号口径与 getCookies 保持一致（都按 env 行序）。
+func tokenOnlineForAccount(st *StoreData, mobile string, idx int) string {
+	envCk, envTok := envCredLine(idx)
+
+	if mobile != "" && st != nil {
+		if cred := st.Creds[mobile]; cred != nil && cred.TokenOnline != "" {
+			// env 未配置该行 → 无从比对，直接用轮换值
+			if envTok == "" {
+				return cred.TokenOnline
+			}
+			// env 行仍是被替换时的那份 → 轮换值接管
+			if cred.EnvEpoch != "" && cred.EnvEpoch == envCredFingerprint(envCk, envTok) {
+				return cred.TokenOnline
+			}
+		}
 	}
-	envToks := splitCookieLines(envTok)
-	if len(fileToks) == 0 {
-		return envToks
+
+	if envTok != "" {
+		return envTok
 	}
-	// 文件与 env 都有: 仅当 env 未被轮换接管时用 env (与 getCookies 的 epoch 机制对齐)
+	// env 与 store 都没有：回落历史遗留的 token 文件（老版本升级路径）
+	if fileToks := readLinesFile(tokenOnlineFile); idx < len(fileToks) {
+		return fileToks[idx]
+	}
+	return ""
+}
+
+// envCredLine 返回 env 配置中第 idx 个账号的 (cookie 行, token_online 行)。
+// 两个 env 变量都按换行分账号，行号一一对应。
+func envCredLine(idx int) (string, string) {
+	envCks := splitCookieLines(getEnv("UNICOM_COOKIE", getEnv("ChinaUnicom_10010v4_cookie", "")))
+	envToks := splitCookieLines(getEnv("ChinaUnicom_10010v4_token_online", ""))
+	ck, tok := "", ""
+	if idx >= 0 && idx < len(envCks) {
+		ck = envCks[idx]
+	}
+	if idx >= 0 && idx < len(envToks) {
+		tok = envToks[idx]
+	}
+	return ck, tok
+}
+
+// migrateLegacyCreds 把旧版按行文件的凭据（10010v4_cookie.txt / 10010v4_token_online.txt
+// 加全局 LoginEnvEpoch）一次性迁入 store.Creds。
+//
+// 不迁移会造成真实故障：旧版把轮换后的 token_online 只写进文件，env 里那份早已作废。
+// 升级后若 Creds 为空，tokenOnlineForAccount 会优先拿 env 的废 token 去登录并失败，
+// 自动登录自愈能力就此丢失。
+func migrateLegacyCreds() {
 	st := loadStoreSafe()
-	if st != nil && st.LoginEnvEpoch != "" && st.LoginEnvEpoch == envCredFingerprint(getEnv("UNICOM_COOKIE", getEnv("ChinaUnicom_10010v4_cookie", "")), envTok) {
-		return fileToks
+	if st == nil || len(st.Creds) > 0 || st.LoginEnvEpoch == "" {
+		return
 	}
-	return envToks
+
+	fileCks := readLinesFile(cookieFile)
+	fileToks := readLinesFile(tokenOnlineFile)
+	if len(fileCks) == 0 {
+		return
+	}
+
+	migrated := 0
+	_, err := lockAndModifyStore(func(s *StoreData) bool {
+		if len(s.Creds) > 0 {
+			return false // 另一个进程已经迁移过
+		}
+		creds := make(map[string]*Credential)
+		for i, ck := range fileCks {
+			mobile := mobileFromCookie(ck)
+			if mobile == "" {
+				continue
+			}
+			tok := ""
+			if i < len(fileToks) {
+				tok = fileToks[i]
+			}
+			envCk, envTok := envCredLine(i)
+			creds[mobile] = &Credential{
+				Mobile:      mobile,
+				Cookie:      ck,
+				TokenOnline: tok,
+				// 用当前 env 行算指纹：旧版的接管状态等价于"env 行未变"，
+				// 迁移后文件凭据继续生效，用户改 env 行即可夺回控制权
+				EnvEpoch:  envCredFingerprint(envCk, envTok),
+				UpdatedAt: time.Now().UnixMilli(),
+			}
+			migrated++
+		}
+		if migrated == 0 {
+			return false
+		}
+		s.Creds = creds
+		s.LoginEnvEpoch = "" // 迁移完成，旧字段退役
+		return true
+	})
+	if err == nil && migrated > 0 {
+		fmt.Printf("🔁 [凭据迁移] 已将 %d 个账号的轮换凭据迁入 store.Creds\n", migrated)
+	}
 }
 
 // readLinesFile 按行读取非空行
@@ -820,7 +1038,7 @@ func readLinesFile(path string) []string {
 	return splitCookieLines(string(data))
 }
 
-// splitCookieLines 按换行拆分并去空白（复用 Cookie 的拆分规则）
+// splitCookieLines 按换行拆分并去空白（绝不按 & 拆，Cookie 内部本身就含 &）
 func splitCookieLines(s string) []string {
 	var out []string
 	for _, l := range strings.Split(s, "\n") {
@@ -832,32 +1050,46 @@ func splitCookieLines(s string) []string {
 	return out
 }
 
-// saveTokenOnline 持久化第 idx 个账号的 token_online（按行对齐，不足补空行占位）
-func saveTokenOnline(idx int, token string) {
-	toks := readLinesFile(tokenOnlineFile)
-	for len(toks) <= idx {
-		toks = append(toks, "")
+// saveCredential 在 flock 临界区内原子写入某手机号的轮换凭据。
+// 凭据存进 store（而非独立的按行文本文件）有两个必要理由：
+//   - 手机号索引不受账号顺序影响，换新 Cookie 也不会串号
+//   - 与 store 共享同一把文件锁，多账号并行换新时不会互相覆盖
+func saveCredential(mobile, cookie, token, envEpoch string) error {
+	if mobile == "" {
+		return fmt.Errorf("缺少手机号，拒绝写入凭据")
 	}
-	toks[idx] = token
-	_ = os.WriteFile(tokenOnlineFile, []byte(strings.Join(toks, "\n")), 0600)
-}
+	_, err := lockAndModifyStore(func(s *StoreData) bool {
+		if s.Creds == nil {
+			s.Creds = make(map[string]*Credential)
+		}
+		cred := s.Creds[mobile]
+		if cred == nil {
+			cred = &Credential{Mobile: mobile}
+			s.Creds[mobile] = cred
+		}
+		cred.Cookie = cookie
+		if token != "" {
+			cred.TokenOnline = token
+		}
+		cred.EnvEpoch = envEpoch
+		cred.UpdatedAt = time.Now().UnixMilli()
 
-// persistCookieLine 更新 cookieFile 中第 idx 行（自动登录换新后调用），并同步 store.Cookies
-func persistCookieLine(idx int, cookie string) {
-	cks := readLinesFile(cookieFile)
-	for len(cks) <= idx {
-		cks = append(cks, "")
-	}
-	cks[idx] = cookie
-	_ = os.WriteFile(cookieFile, []byte(strings.Join(cks, "\n")), 0600)
-	_, _ = lockAndModifyStore(func(s *StoreData) bool {
-		if len(s.Cookies) != len(cks) {
-			s.Cookies = cks
-		} else {
-			s.Cookies[idx] = cookie
+		// 同步 store.Cookies 中该账号所在行，供独立进程兜底读取
+		for i, ck := range s.Cookies {
+			if mobileFromCookie(ck) == mobile {
+				s.Cookies[i] = cookie
+				break
+			}
 		}
 		return true
 	})
+	if err == nil {
+		// 冗余落一份明文 Cookie 文件，兼容旧部署脚本与人工排查（失败不影响主流程）
+		if st := loadStoreSafe(); st != nil && len(st.Cookies) > 0 {
+			_ = writeFileAtomic(cookieFile, []byte(strings.Join(st.Cookies, "\n")), 0600)
+		}
+	}
+	return err
 }
 
 // unicomLoginPost 发起联通手厅登录 POST，返回 (Set-Cookie 拼接, 响应 JSON, 错误)
@@ -1004,31 +1236,54 @@ func passwordLogin(mobile, password string) (string, string, error) {
 	return newCookie, newToken, nil
 }
 
-// autoRelogin Cookie 失效自愈编排: TokenOnline 优先 → 密码登录兜底
-// 成功后持久化新凭据（cookieFile/tokenOnlineFile/store.Cookies/LoginEnvEpoch），返回新 Cookie
+// autoRelogin Cookie 失效自愈编排: TokenOnline 优先 → 密码登录兜底。
+//
+// 成功后把新凭据按手机号写进 store.Creds（flock 保护），返回新 Cookie。
+// 两条硬约束：
+//   - 新 Cookie 的手机号必须与失效 Cookie 的手机号一致，否则拒绝持久化。
+//     否则多账号场景下，全局单一的 mobile/password 配置会把账号 A 的 Cookie
+//     写进账号 B 的槽位，让 B 的监控静默死亡而用户毫无感知。
+//   - 密码兜底只在能确认归属时使用；无法确认手机号时不落盘。
 func autoRelogin(idx int, oldCookie string) (string, bool) {
-	envCookie := getEnv("UNICOM_COOKIE", getEnv("ChinaUnicom_10010v4_cookie", ""))
-	envToken := getEnv("ChinaUnicom_10010v4_token_online", "")
+	oldMobile := mobileFromCookie(oldCookie)
 
-	toks := getTokenOnlines()
-	var tok string
-	if idx < len(toks) {
-		tok = toks[idx]
+	// 归属校验 + 持久化：登录换来的凭据必须属于这个账号
+	persist := func(newCookie, newToken, envEpoch string) (string, bool) {
+		newMobile := mobileFromCookie(newCookie)
+		if oldMobile != "" && newMobile != "" && oldMobile != newMobile {
+			fmt.Printf("⛔ [自动登录] 新 Cookie 归属账号与原账号不一致，拒绝写入（避免多账号串号）\n")
+			return oldCookie, false
+		}
+		mobile := newMobile
+		if mobile == "" {
+			mobile = oldMobile
+		}
+		if mobile == "" {
+			fmt.Println("⛔ [自动登录] 无法从 Cookie 中确认手机号，拒绝写入凭据")
+			return oldCookie, false
+		}
+		if err := saveCredential(mobile, newCookie, newToken, envEpoch); err != nil {
+			// 凭据落盘失败而 token 已被服务端轮换 = 旧 token 已作废且新 token 未保存，
+			// 必须显式报错，否则下一轮会拿着废 token 反复失败且无迹可查
+			fmt.Printf("❌ [自动登录] 新凭据写入失败: %v（新 token 可能已丢失，请检查存储可写性）\n", err)
+			return oldCookie, false
+		}
+		return newCookie, true
 	}
 
-	// 1. TokenOnline 自动登录
+	st := loadStoreSafe()
+	envCk, envTok := envCredLine(idx)
+	envEpoch := envCredFingerprint(envCk, envTok)
+
+	// 1. TokenOnline 自动登录（首选：无需明文密码，token 由服务端轮换）
+	tok := tokenOnlineForAccount(st, oldMobile, idx)
 	if tok != "" {
 		fmt.Printf("🔄 [自动登录] 尝试 TokenOnline 登录 (账号 %d)...\n", idx+1)
 		newCookie, newToken, invalidat, err := tokenOnlineLogin(tok)
 		if err == nil {
 			fmt.Printf("✅ [自动登录] TokenOnline 登录成功 (有效期: %s)，已换新 Cookie (%d 字节)\n",
 				invalidat, len(newCookie))
-			if newToken != "" {
-				saveTokenOnline(idx, newToken)
-			}
-			persistCookieLine(idx, newCookie)
-			markLoginEnvEpoch(envCookie, envToken)
-			return newCookie, true
+			return persist(newCookie, newToken, envEpoch)
 		}
 		fmt.Printf("⚠️ [自动登录] TokenOnline 登录失败: %v\n", err)
 	} else {
@@ -1039,37 +1294,21 @@ func autoRelogin(idx int, oldCookie string) (string, bool) {
 	mobile := strings.TrimSpace(getEnv("ChinaUnicom_10010v4_mobile", ""))
 	password := strings.TrimSpace(getEnv("ChinaUnicom_10010v4_password", ""))
 	if mobile != "" && password != "" {
+		// mobile/password 是全局单值配置，与当前账号不符时必须跳过而不是照登
+		if oldMobile != "" && mobile != oldMobile {
+			fmt.Printf("⚠️ [自动登录] 已配置的密码账号与本账号不同，跳过密码兜底（避免串号）\n")
+			return oldCookie, false
+		}
 		fmt.Printf("🔄 [自动登录] 尝试服务密码登录 (账号 %d)...\n", idx+1)
 		newCookie, newToken, err := passwordLogin(mobile, password)
 		if err == nil {
 			fmt.Printf("✅ [自动登录] 密码登录成功，已换新 Cookie (%d 字节)\n", len(newCookie))
-			if newToken != "" {
-				saveTokenOnline(idx, newToken)
-			}
-			persistCookieLine(idx, newCookie)
-			markLoginEnvEpoch(envCookie, envToken)
-			return newCookie, true
+			return persist(newCookie, newToken, envEpoch)
 		}
 		fmt.Printf("⚠️ [自动登录] 密码登录失败: %v\n", err)
 	}
 
 	return oldCookie, false
-}
-
-// markLoginEnvEpoch 记录"被自动登录替换的 env 指纹"，env 未变化时文件凭据持续接管，
-// 用户更新 env 后指纹变化，env 立即重新生效
-func markLoginEnvEpoch(envCookie, envToken string) {
-	fp := envCredFingerprint(envCookie, envToken)
-	if fp == "" {
-		return
-	}
-	_, _ = lockAndModifyStore(func(s *StoreData) bool {
-		if s.LoginEnvEpoch != fp {
-			s.LoginEnvEpoch = fp
-			return true
-		}
-		return false
-	})
 }
 
 // ======================== 消息推送客户端 ========================
@@ -1087,7 +1326,7 @@ func mobileFromCookie(cookie string) string {
 // 账号稳定 key：优先用 Cookie 内的手机号指纹。
 // 手机号在自动登录换新 Cookie 后保持不变，基线与历史不会因换 Cookie 而丢失；
 // 取不到手机号时回落到 Cookie 全文指纹（旧行为）。
-func accountKey(cookie string, idx int) string {
+func accountKey(cookie string) string {
 	if mobile := mobileFromCookie(cookie); mobile != "" {
 		sum := md5.Sum([]byte("mobile:" + mobile))
 		return "acc_" + hex.EncodeToString(sum[:])[:8]
@@ -1101,20 +1340,13 @@ func legacyCookieKey(cookie string) string {
 	return "acc_" + hex.EncodeToString(sum[:])[:8]
 }
 
-// 兼容旧 key：从 Cookie 全文指纹 key 或 acc_N 下标 key 迁移到手机号 key。
-// 多个旧条目同时存在时（如换 Cookie 产生的漂移副本）取历史最丰富的一条，
-// 避免把刚建立的空基线当成账号真身。
-func migrateLegacyAccountKey(store *StoreData, cookie string, idx int) string {
-	key := accountKey(cookie, idx)
-	if _, ok := store.Accounts[key]; ok {
-		return key
-	}
-
-	candidates := []string{legacyCookieKey(cookie), fmt.Sprintf("acc_%d", idx)}
+// pickLegacyAccount 在旧 key 候选中选出账号真身：历史最丰富、其次基线最新。
+// 换 Cookie 会留下漂移副本，取"第一个命中"可能选到刚建立的空基线。
+func pickLegacyAccount(store *StoreData, cookie string, idx int, exclude string) (string, *AccountStore) {
 	bestKey := ""
 	var best *AccountStore
-	for _, ck := range candidates {
-		if ck == key {
+	for _, ck := range []string{legacyCookieKey(cookie), fmt.Sprintf("acc_%d", idx)} {
+		if ck == exclude {
 			continue
 		}
 		old, ok := store.Accounts[ck]
@@ -1126,7 +1358,17 @@ func migrateLegacyAccountKey(store *StoreData, cookie string, idx int) string {
 			best, bestKey = old, ck
 		}
 	}
+	return bestKey, best
+}
 
+// 兼容旧 key：从 Cookie 全文指纹 key 或 acc_N 下标 key 迁移到手机号 key。
+func migrateLegacyAccountKey(store *StoreData, cookie string, idx int) string {
+	key := accountKey(cookie)
+	if _, ok := store.Accounts[key]; ok {
+		return key
+	}
+
+	bestKey, best := pickLegacyAccount(store, cookie, idx, key)
 	if best != nil {
 		store.Accounts[key] = best
 		delete(store.Accounts, bestKey)
@@ -1314,11 +1556,17 @@ func notifyFault(reason string) {
 		return shouldSend
 	})
 
-	if errors.Is(lockErr, ErrAcquireLockTimeout) {
-		fmt.Println("⚠️ [存储] 抢锁超时，故障告警改为无冷却直接发送")
+	if lockErr != nil {
+		// 抢不到锁/读盘失败时闭包没跑过，owner 仍为空。
+		// 故障告警是最后一道通知，宁可无冷却重发也不能静默丢弃，
+		// 因此这里必须自行补齐 owner（先 env，再只读兜底 store.OwnerID）。
+		fmt.Printf("⚠️ [存储] 故障告警无法读写冷却状态 (%v)，改为无冷却直接发送\n", lockErr)
 		shouldSend = true
+		owner = tgUserID
 		if owner == "" {
-			owner = tgUserID
+			if st := loadStoreSafe(); st != nil {
+				owner = st.OwnerID
+			}
 		}
 	}
 
@@ -1392,10 +1640,29 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 		} `json:"resources"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		// 非 JSON 响应（如会话失效时返回裸错误码 "999999" 或登录页 HTML）→ 判定 Cookie 失效，
-		// 触发自动登录自愈而非静默"临时波动"
-		return nil, &AuthError{Msg: fmt.Sprintf("联通接口返回非 JSON 响应 (疑似 Cookie 失效): %v", err)}
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if readErr != nil {
+		return nil, fmt.Errorf("读取联通响应失败: %w", readErr)
+	}
+
+	if err := json.Unmarshal(raw, &data); err != nil {
+		// 只有"确实像会话失效"的响应才判 AuthError 去触发自动登录：
+		// 裸错误码 999999、登录页 HTML、明文提示。
+		// 把所有解析失败一律判成失效会在联通接口改版或返回网关错误页时
+		// 反复消耗登录次数（token_online 每次登录都轮换，滥用有风控风险）。
+		body := strings.TrimSpace(string(raw))
+		peek := body
+		if len(peek) > 200 {
+			peek = peek[:200]
+		}
+		looksAuth := body == "999999" ||
+			strings.Contains(body, "999999") ||
+			strings.Contains(body, "登录") ||
+			strings.Contains(strings.ToLower(body), "login")
+		if looksAuth {
+			return nil, &AuthError{Msg: fmt.Sprintf("联通接口返回会话失效响应: %s", peek)}
+		}
+		return nil, fmt.Errorf("联通接口响应无法解析 (可能接口改版或网关错误页): %s", peek)
 	}
 
 	if data.Code != "0000" {
@@ -1417,7 +1684,9 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 	for _, res := range data.Resources {
 		if res.Type == "flow" || res.Type == "MlFlowdetailsList" {
 			for _, item := range res.Details {
-				name := item.FeePolicyName + item.AddUpItemName
+				// 用分隔符拼接两个字段，避免关键词跨字段边界误命中
+				// （如 "…套餐" + "免流…" 拼成 "套餐免流" 后被"餐免"之类的词组匹配）
+				name := strings.TrimSpace(item.FeePolicyName) + " " + strings.TrimSpace(item.AddUpItemName)
 
 				// 排除名单：命中的干扰项（如日租宝/赠款）不参与任何统计
 				if len(excludeKeywords) > 0 && matchAnyKeyword(name, excludeKeywords) {
@@ -1512,7 +1781,7 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 	todayZero := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, cst).UnixMilli()
 	// 账号 key 必须与监控周期写入时一致，否则主动查询（TG 按钮）会读到空基线，
 	// 导致"今日用量恒为 0"与"永远首次记录"
-	accKey := accountKey(cookie, accountIndex)
+	accKey := accountKey(cookie)
 
 	currentSnap := &UsageSnapshot{
 		FreeUnlimitedUsed: freeUnlimitUsed,
@@ -1538,8 +1807,13 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 				store.Accounts[accKey] = acc
 			}
 
-			// 【防抖保护】：非账期日且之前已有正常用量，但接口突发归零，视为网关故障脏数据，拒绝刷乱基线
-			if now.Day() != billingDay && acc.Last != nil && acc.Last.NormalUsed > 10 && normUsed == 0 {
+			// 【防抖保护】：接口突发归零视为网关故障脏数据，拒绝刷乱基线。
+			// 通用与免流两个池都要保护——免流池归零同样会毁掉基线，
+			// 之后单轮增量虚高、今日用量失真。
+			// 账期日前后 3 天放行真实归零（billingDay=31 在小月不存在，用范围判定而非等值）。
+			inBillingWindow := now.Day() >= billingDay && now.Day()-billingDay < 3
+			if !inBillingWindow && acc.Last != nil &&
+				((acc.Last.NormalUsed > 10 && normUsed == 0) || (acc.Last.FreeUsed > 10 && freeUsed == 0)) {
 				fmt.Println("⚠️ [防抖保护] 接口用量突发归零（疑似网关维护），本次放弃覆盖基线。")
 				return false
 			}
@@ -1581,6 +1855,25 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 				Snapshot:  currentSnap,
 			})
 
+			// 今日基线处理：仅跨天/首次时重置；同一天内用量倒退视为接口抖动，保留原基线。
+			//
+			// 必须在 trim 之前执行：跨天重置要回溯"昨天最后一条 ≤ 零点的快照"，
+			// 而 trim 会按 historyKeepHours 删掉老记录（可低至 1 小时）。
+			// 若先 trim，跨夜停机或 keepHours<24h 时零点基线会被删掉，
+			// 基线退化成当前快照，凌晨到首检的真实消耗整段漏算。
+			if acc.Today == nil || acc.TodayDate != todayZero {
+				base := currentSnap
+				if idx := lastSnapshotBeforeMs(acc.History, todayZero); idx >= 0 && acc.History[idx].Snapshot != nil {
+					base = acc.History[idx].Snapshot
+					fmt.Printf("🌅 [今日基线] 采用昨日最后快照 (%s) 作为零点基线，补齐凌晨空窗。\n",
+						time.UnixMilli(acc.History[idx].Timestamp).In(cst).Format("01-02 15:04"))
+				} else if len(acc.History) > 0 {
+					fmt.Println("⚠️ [今日基线] 未找到零点前的历史快照（跨夜停机或保留时长过短），今日用量从本次开始计。")
+				}
+				acc.Today = base
+				acc.TodayDate = todayZero
+			}
+
 			// 守卫 5: trim 只删超过保留时长（historyKeepHours，默认 24 小时）的最老记录
 			oneDayAgo := now.Add(-time.Duration(historyKeepHours * float64(time.Hour))).UnixMilli()
 			if len(acc.History) > 0 && acc.History[0].Timestamp < oneDayAgo {
@@ -1594,20 +1887,6 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 				if validIdx > 0 {
 					acc.History = acc.History[validIdx:]
 				}
-			}
-
-			// 今日基线处理：仅跨天/首次时重置；同一天内用量倒退视为接口抖动，保留原基线
-			if acc.Today == nil || acc.TodayDate != todayZero {
-				// 跨天重置时优先回溯"昨天最后一条历史快照"作零点基线，
-				// 补齐任务在 00:00 空窗期未运行导致的今日用量少算（漏掉凌晨消耗）
-				base := currentSnap
-				if idx := lastSnapshotBeforeMs(acc.History, todayZero); idx >= 0 && acc.History[idx].Snapshot != nil {
-					base = acc.History[idx].Snapshot
-					fmt.Printf("🌅 [今日基线] 采用昨日最后快照 (%s) 作为零点基线，补齐凌晨空窗。\n",
-						time.UnixMilli(acc.History[idx].Timestamp).In(cst).Format("01-02 15:04"))
-				}
-				acc.Today = base
-				acc.TodayDate = todayZero
 			}
 
 			todayNorm = normUsed - acc.Today.NormalUsed
@@ -1670,7 +1949,10 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 		})
 
 		if lockErr != nil {
-			fmt.Printf("⚠️ [存储] 本次基线写入失败 (%v)，跳点数据不可信\n", lockErr)
+			// 抢锁超时 → 闭包根本没执行，diffs 全为 0、durationStr 还是"首次记录"；
+			// 落盘失败 → diffs 基于未持久化的基线，下一轮会重算同一段增量并重复推送。
+			// 两种情况的结果都不可信，必须返回错误而不是交出半成品。
+			return nil, fmt.Errorf("基线写入失败，本次跳点数据不可信: %w", lockErr)
 		}
 	} else {
 		// ================= 守卫 2 & 3: 主动查询只读 loadStoreSafe，不写快照、不改基线与冷却 =================
@@ -1678,24 +1960,34 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 		acc, ok := store.Accounts[accKey]
 		if !ok || acc == nil {
 			// 只读兜底：手机号 key 尚未落盘时（首个监控周期还没跑），
-			// 回退查旧的 Cookie 指纹 / 下标 key，避免主动查询显示空基线
-			for _, fk := range []string{legacyCookieKey(cookie), fmt.Sprintf("acc_%d", accountIndex)} {
-				if old, found := store.Accounts[fk]; found && old != nil {
-					acc = old
-					break
-				}
+			// 回退查旧 key。选取规则与 migrateLegacyAccountKey 一致（取历史最丰富的），
+			// 否则升级后首次写入前可能展示较贫瘠的那份基线。
+			if _, old := pickLegacyAccount(store, cookie, accountIndex, accKey); old != nil {
+				acc = old
 			}
 		}
 		if acc == nil {
 			acc = &AccountStore{}
 		}
 
-		if acc.Today != nil && acc.TodayDate == todayZero {
-			todayNorm = normUsed - acc.Today.NormalUsed
-			todayNormLimit = normLimitUsed - acc.Today.NormalLimitedUsed
-			todayFree = freeUsed - acc.Today.FreeUsed
-			todayFreeUnlimit = freeUnlimitUsed - acc.Today.FreeUnlimitedUsed
-			todayFreeLimit = freeLimitUsed - acc.Today.FreeLimitedUsed
+		// 只读路径的今日基线：与写入分支口径对齐。
+		// TodayDate 匹配时直接用已落盘的基线；不匹配（跨天后 cron 还没跑过，
+		// 或 cron 已停摆）则临时回溯零点前的历史快照算出展示值——不落盘。
+		// 否则 cron 挂掉时"今日用量"会整天显示 0.00M，而同屏还写着"距上次 5 小时"，
+		// 自相矛盾且恰好误导用户排障。
+		todayBase := acc.Today
+		if acc.Today == nil || acc.TodayDate != todayZero {
+			todayBase = nil
+			if idx := lastSnapshotBeforeMs(acc.History, todayZero); idx >= 0 && acc.History[idx].Snapshot != nil {
+				todayBase = acc.History[idx].Snapshot
+			}
+		}
+		if todayBase != nil {
+			todayNorm = normUsed - todayBase.NormalUsed
+			todayNormLimit = normLimitUsed - todayBase.NormalLimitedUsed
+			todayFree = freeUsed - todayBase.FreeUsed
+			todayFreeUnlimit = freeUnlimitUsed - todayBase.FreeUnlimitedUsed
+			todayFreeLimit = freeLimitUsed - todayBase.FreeLimitedUsed
 
 			if todayNorm < 0 {
 				todayNorm = 0
@@ -1775,6 +2067,8 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 			if !isHistoryMatch {
 				durationStr = formatDuration(elapsed)
 			}
+			// 只读分支同样要给出 elapsedMinutes，否则 [通用速率]/[免流速率] 恒为占位符 "—"
+			elapsedMinutes = elapsed.Minutes()
 
 			if normUsed >= baseSnap.NormalUsed {
 				diffNorm = normUsed - baseSnap.NormalUsed
@@ -1941,7 +2235,6 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 	botContent := fmt.Sprintf("%s\n%s", renderTemplate(botTitleTpl, escapedVars), renderTemplate(botDescTpl, escapedVars))
 
 	return &QueryResult{
-		PackageName:    pkgName,
 		DurationStr:    durationStr,
 		DiffNormal:     diffNorm,
 		DiffFree:       diffFree,
@@ -1951,6 +2244,7 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 		AutoContent:    autoContent,
 		BotContent:     botContent,
 		AccKey:         accKey,
+		AccountIndex:   accountIndex,
 		ElapsedMinutes: elapsedMinutes,
 		SurgeSkipped:   surgeSkipped,
 	}, nil
@@ -1963,7 +2257,11 @@ func isPidOurDaemon(pid int) bool {
 		return false
 	}
 	if err := syscall.Kill(pid, 0); err != nil {
-		return false
+		// EPERM 表示进程活着但当前用户无权发信号（cron 与 daemon 不同用户时会出现），
+		// 必须判为"存在"，否则会抢走运行中 daemon 的 pidfile
+		if !errors.Is(err, syscall.EPERM) {
+			return false
+		}
 	}
 	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 	if err != nil {
@@ -1982,27 +2280,35 @@ func readPidFile() int {
 	return pid
 }
 
-func claimPidFile() bool {
-	f, err := os.OpenFile(pidFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
-	if err == nil {
-		_, _ = f.WriteString(strconv.Itoa(os.Getpid()))
-		f.Close()
-		return true
-	}
+// pidFileLock 在 daemon 整个生命周期内持有 pidFile 的 flock。
+// 进程退出（含 os.Exit / 被 kill / 崩溃）时内核自动释放，因此不存在陈旧锁。
+var pidFileLock *os.File
 
-	oldPid := readPidFile()
-	if oldPid > 0 && oldPid != os.Getpid() && isPidOurDaemon(oldPid) {
+// claimPidFile 用 flock 而非 "O_EXCL 创建 + 读回校验" 做单例仲裁。
+//
+// O_EXCL 方案有一个真实的空窗：A 创建成功但还没写入 PID 时，B 的 O_EXCL 失败、
+// 读到空文件（pid=0）→ 认为是僵尸文件 → 删掉 A 的文件并重建 → 两个 daemon 同时运行。
+// flock 是内核级原子门槛，先抢锁后写 PID，没有这个窗口，也顺带免疫 PID 复用。
+func claimPidFile() bool {
+	f, err := os.OpenFile(pidFile, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
 		return false
 	}
-
-	_ = os.Remove(pidFile)
-	fRetry, errRetry := os.OpenFile(pidFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
-	if errRetry == nil {
-		_, _ = fRetry.WriteString(strconv.Itoa(os.Getpid()))
-		fRetry.Close()
-		return true
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		// 锁被持有 = 已有 daemon 在跑，无论文件内容是否陈旧
+		_ = f.Close()
+		return false
 	}
-	return false
+	pidFileLock = f // 持锁到进程退出，不可关闭
+	_ = f.Truncate(0)
+	if _, err := f.WriteAt([]byte(strconv.Itoa(os.Getpid())), 0); err != nil {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+		pidFileLock = nil
+		return false
+	}
+	_ = f.Sync()
+	return true
 }
 
 func stopDaemon() {
@@ -2020,9 +2326,11 @@ func stopDaemon() {
 // ======================== 后台 TG 响应协程 ========================
 
 // buildTGInlineKeyboard 构建 TG 内联键盘。
+//
 // diffMin 是当前消息所用的对比时长，刷新键据此重放同一种查询，
 // 标签必须与 callback_data 语义一致（否则会出现"标签写 30 分钟、实际跑实时"的错配）。
-func buildTGInlineKeyboard(diffMin int) map[string]interface{} {
+// accIdx 编进 callback_data，否则多账号时刷新账号 2 的消息会显示账号 1 的数据。
+func buildTGInlineKeyboard(diffMin, accIdx int) map[string]interface{} {
 	var refreshLabel string
 	switch {
 	case diffMin == -1:
@@ -2033,17 +2341,42 @@ func buildTGInlineKeyboard(diffMin int) map[string]interface{} {
 		// diffMin == 0：对比上次自动巡检，与「⚡ 实时跳点」同义，不能标成分钟数
 		refreshLabel = "🔄 刷新当前"
 	}
+	// callback_data 格式 refresh_<分钟>_<账号下标>；旧格式 refresh_<分钟> 仍可解析（下标默认 0）
 	return map[string]interface{}{
 		"inline_keyboard": [][]map[string]string{
 			{
-				{"text": refreshLabel, "callback_data": fmt.Sprintf("refresh_%d", diffMin)},
-				{"text": "⚡ 实时跳点", "callback_data": "refresh_0"},
+				{"text": refreshLabel, "callback_data": fmt.Sprintf("refresh_%d_%d", diffMin, accIdx)},
+				{"text": "⚡ 实时跳点", "callback_data": fmt.Sprintf("refresh_0_%d", accIdx)},
 			},
 			{
-				{"text": "📦 套餐总余量", "callback_data": "refresh_-1"},
+				{"text": "📦 套餐总余量", "callback_data": fmt.Sprintf("refresh_-1_%d", accIdx)},
 			},
 		},
 	}
+}
+
+// parseRefreshCallback 解析 refresh 回调，返回 (对比分钟数, 账号下标, 是否匹配)。
+// 兼容旧格式 refresh_<分钟>（历史消息上的按钮仍然可用，下标回落 0）。
+func parseRefreshCallback(data string) (int, int, bool) {
+	if !strings.HasPrefix(data, "refresh_") {
+		return 0, 0, false
+	}
+	body := strings.TrimPrefix(data, "refresh_")
+	if body == "jump" {
+		return 0, 0, true
+	}
+	parts := strings.Split(body, "_")
+	min, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, false
+	}
+	idx := 0
+	if len(parts) >= 2 {
+		if v, e := strconv.Atoi(parts[1]); e == nil && v >= 0 {
+			idx = v
+		}
+	}
+	return min, idx, true
 }
 
 func runTGDaemon() {
@@ -2056,12 +2389,12 @@ func runTGDaemon() {
 		return
 	}
 
-	// 注册 Telegram 官方菜单指令
+	// 注册 Telegram 官方菜单指令（须与 /start 帮助文字、内联键盘保持同一套语义）
 	tgSend("setMyCommands", map[string]interface{}{
 		"commands": []map[string]string{
 			{"command": "check", "description": "⚡ 实时跳点 (对比上次自动巡检)"},
-			{"command": "diff", "description": "🔍 查询跳点 (回溯独立时长)"},
 			{"command": "total", "description": "📦 套餐总余量"},
+			{"command": "diff", "description": "🔍 回溯跳点 (可加分钟数，如 /diff 60)"},
 			{"command": "help", "description": "💡 帮助与使用指南"},
 		},
 	})
@@ -2084,11 +2417,26 @@ func runTGDaemon() {
 		cancel()
 		cleanup()
 	}()
-	// 🌟 后台回环巡检引擎（默认关闭，避免与面板 Cron 双循环重复推送）
-	// 推荐由外部 Cron（*/3 分钟）统一驱动巡检与告警；仅当不使用面板 Cron 时才开启此引擎
-	// 可通过 AUTO_CHECK_INTERVAL_MIN 显式开启（如 3）
+	// 🌟 后台回环巡检引擎（默认关闭）。
+	//
+	// 与外部 Cron 同时驱动巡检是危险的，不只是"重复推送"：两个进程交替写基线，
+	// 同一次真实跳点会被切成两半各自判定——真实 60M/3分、阈值 50M 时，
+	// 两边各只看到 ~30M，增量与速率双双低于阈值，结果是永久静默。
+	// 冷却能防重复，防不了这种稀释。所以只在不使用面板 Cron 时才开启此引擎。
 	loopMin, _ := strconv.Atoi(getEnv("AUTO_CHECK_INTERVAL_MIN", "0"))
 	if loopMin > 0 {
+		if st := loadStoreSafe(); st != nil {
+			for _, acc := range st.Accounts {
+				// 外部 Cron 正在跑的判据：基线在 2 倍回环周期内被别的进程更新过
+				if acc != nil && acc.LastTime > 0 &&
+					time.Since(time.UnixMilli(acc.LastTime)) < time.Duration(loopMin*2)*time.Minute {
+					fmt.Printf("⚠️ [配置冲突] 检测到近 %d 分钟内已有外部巡检写入基线，"+
+						"内置回环引擎与面板 Cron 同时驱动会把跳点稀释到阈值以下而永久静默。"+
+						"请二选一：关闭 AUTO_CHECK_INTERVAL_MIN 或停用面板 Cron。\n", loopMin*2)
+					break
+				}
+			}
+		}
 		go func() {
 			fmt.Printf("🔄 [Go-v4x] 启动后台回环巡检引擎 (每 %d 分钟巡检一次)\n", loopMin)
 			ticker := time.NewTicker(time.Duration(loopMin) * time.Minute)
@@ -2118,26 +2466,47 @@ func runTGDaemon() {
 		offset = store.TGOffset
 	}
 
-	if offset == 0 {
+	// bootstrapOffset 用 getUpdates?offset=-1 取最新 update_id 作为起点，丢弃积压。
+	// 必须确认成功：失败后若带着 offset=0 进主循环，会把停机期间积压的所有旧命令
+	// 全部重放一遍（历史"查跳点"被批量执行、消息刷屏）。
+	bootstrapOffset := func() bool {
 		reqURL := fmt.Sprintf("%s/bot%s/getUpdates?offset=-1&timeout=0", tgApiHost, tgBotToken)
-		if r, e := httpClient.Get(reqURL); e == nil {
-			var ir struct {
-				OK     bool `json:"ok"`
-				Result []struct {
-					UpdateID int64 `json:"update_id"`
-				} `json:"result"`
+		r, e := httpClient.Get(reqURL)
+		if e != nil {
+			return false
+		}
+		defer r.Body.Close()
+		var ir struct {
+			OK     bool `json:"ok"`
+			Result []struct {
+				UpdateID int64 `json:"update_id"`
+			} `json:"result"`
+		}
+		if json.NewDecoder(r.Body).Decode(&ir) != nil || !ir.OK {
+			return false
+		}
+		if len(ir.Result) > 0 {
+			offset = ir.Result[len(ir.Result)-1].UpdateID + 1
+			_, _ = lockAndModifyStore(func(s *StoreData) bool {
+				s.TGOffset = offset
+				return true
+			})
+		}
+		// 队列为空也是有效结果：没有积压，offset 保持 0 即可
+		return true
+	}
+
+	if offset == 0 {
+		for attempt := 1; attempt <= 3; attempt++ {
+			if bootstrapOffset() {
+				break
 			}
-			if json.NewDecoder(r.Body).Decode(&ir) == nil && len(ir.Result) > 0 {
-				offset = ir.Result[len(ir.Result)-1].UpdateID + 1
-				_, _ = lockAndModifyStore(func(s *StoreData) bool {
-					s.TGOffset = offset
-					return true
-				})
-				if store != nil {
-					store.TGOffset = offset
-				}
+			fmt.Printf("⚠️ [TG] 第 %d 次获取起始 offset 失败，重试中...\n", attempt)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(3 * time.Second):
 			}
-			r.Body.Close()
 		}
 	}
 
@@ -2260,9 +2629,10 @@ func runTGDaemon() {
 							"💡 <b>菜单功能指南：</b>\n" +
 							"• <b>⚡ 实时跳点</b> (<code>/check</code>) : 对比上次自动巡检的实时跳点\n" +
 							"• <b>📦 套餐总余量</b> (<code>/total</code>) : 查看当前套餐余量与今日用量\n\n" +
-							"💡 <b>高级指令（回溯任意时长）：</b>\n" +
-							"• 输入指定分钟数，如 <code>/check 10</code>、<code>/check 30</code>\n" +
-							"• 亦可直接发送纯文字，例如 <code>5分钟</code>、<code>60分钟</code>\n\n" +
+							"💡 <b>回溯任意时长：</b>\n" +
+							"• <code>/check 60</code>、<code>/diff 30</code> — 对比 N 分钟前的用量\n" +
+							"• 亦可直接发送纯文字，例如 <code>5分钟</code>、<code>60分钟</code>\n" +
+							"• <code>/diff</code> 不带参数时用默认时长（可由 bot_minutes 配置）\n\n" +
 							"👇 点击下方菜单大按钮即可快速查询：",
 						"parse_mode": "HTML",
 						"reply_markup": map[string]interface{}{
@@ -2275,30 +2645,31 @@ func runTGDaemon() {
 				} else if text == "/check" || text == "⚡ 实时跳点" || text == "⚡ 实时查跳点" {
 					isQueryCmd = true
 					queryMinutes = 0
-				} else if text == "/diff" || text == "🔍 查询跳点" || text == "查询跳点" {
-					isQueryCmd = true
-					if botDiffMinutes > 0 {
-						queryMinutes = botDiffMinutes
-					} else {
-						queryMinutes = 30
-					}
 				} else if text == "📦 套餐总余量" || text == "/total" {
 					isQueryCmd = true
 					queryMinutes = -1
-				} else if text == "⏱ 查5分钟跳点" || text == "5分钟" || text == "5m" {
+				} else if text == "/diff" || text == "🔍 查询跳点" || text == "查询跳点" {
+					// /diff 不带参数时用 ChinaUnicom_10010v4_bot_minutes（默认 30）
 					isQueryCmd = true
-					queryMinutes = 5
-				} else if text == "⏱ 查10分钟跳点" || text == "10分钟" || text == "10m" {
-					isQueryCmd = true
-					queryMinutes = 10
+					queryMinutes = botDiffMinutes
 				} else if strings.HasPrefix(text, "/check") || strings.HasPrefix(text, "/diff") || strings.HasPrefix(text, "/查") {
 					parts := strings.Fields(text)
-					isQueryCmd = true
+					arg := ""
 					if len(parts) >= 2 {
-						cleaned := strings.TrimSuffix(strings.TrimSuffix(parts[1], "分钟"), "m")
-						if m, err := strconv.Atoi(cleaned); err == nil && m > 0 {
-							queryMinutes = m
-						}
+						arg = parts[1]
+					}
+					cleaned := strings.TrimSuffix(strings.TrimSuffix(arg, "分钟"), "m")
+					m, err := strconv.Atoi(cleaned)
+					if err != nil || m <= 0 {
+						// 参数无效必须明说：静默回落成实时查询会让用户以为查的是回溯
+						tgSend("sendMessage", map[string]interface{}{
+							"chat_id":    chatID,
+							"text":       fmt.Sprintf("⚠️ 无法识别的时长参数 <code>%s</code>，请用正整数分钟，例如 <code>/check 30</code>", html.EscapeString(arg)),
+							"parse_mode": "HTML",
+						})
+					} else {
+						isQueryCmd = true
+						queryMinutes = m
 					}
 				} else if matched, _ := regexp.MatchString(`^\d+\s*(?:分钟|min|m)$`, text); matched {
 					re := regexp.MustCompile(`\d+`)
@@ -2318,22 +2689,24 @@ func runTGDaemon() {
 						})
 					} else {
 						nowMs := time.Now().In(cst).UnixMilli()
-						if !atomic.CompareAndSwapInt32(&isQueryingAtomic, 0, 1) {
-							tgSend("sendMessage", map[string]interface{}{
-								"chat_id": chatID,
-								"text":    "⏳ 正在查询中，请勿重复点击...",
-							})
-							continue
-						}
 
+						// 冷却先于单飞锁检查：抢锁后再拒绝就必须手动回滚锁，
+						// 任何一条提前 continue 都会把机器人永久卡在"正在查询中"
 						lastTime := atomic.LoadInt64(&lastManualQueryAt)
 						if lastTime > 0 && (nowMs-lastTime) < manualCooldownSec*1000 {
 							remainSec := manualCooldownSec - (nowMs-lastTime)/1000
-							atomic.StoreInt32(&isQueryingAtomic, 0)
 							tgSend("sendMessage", map[string]interface{}{
 								"chat_id":    chatID,
 								"text":       fmt.Sprintf("⚡ 刚刚才查过，请 <b>%d</b> 秒后再试~", remainSec),
 								"parse_mode": "HTML",
+							})
+							continue
+						}
+
+						if !atomic.CompareAndSwapInt32(&isQueryingAtomic, 0, 1) {
+							tgSend("sendMessage", map[string]interface{}{
+								"chat_id": chatID,
+								"text":    "⏳ 正在查询中，请勿重复点击...",
 							})
 							continue
 						}
@@ -2359,7 +2732,7 @@ func runTGDaemon() {
 										"chat_id":      cid,
 										"text":         content,
 										"parse_mode":   "HTML",
-										"reply_markup": buildTGInlineKeyboard(qMin),
+										"reply_markup": buildTGInlineKeyboard(qMin, i),
 									})
 								}
 							}
@@ -2382,32 +2755,26 @@ func runTGDaemon() {
 					owner = curStore.OwnerID
 				}
 
-				if chatID == owner && (cq.Data == "refresh_jump" || strings.HasPrefix(cq.Data, "refresh_")) {
-					qMin := 0
-					if strings.HasPrefix(cq.Data, "refresh_") {
-						mStr := strings.TrimPrefix(cq.Data, "refresh_")
-						if m, err := strconv.Atoi(mStr); err == nil {
-							qMin = m
-						}
-					}
-
+				qMin, accIdx, isRefresh := parseRefreshCallback(cq.Data)
+				if chatID == owner && isRefresh {
 					nowMs := time.Now().In(cst).UnixMilli()
+
+					// 冷却先于单飞锁检查：抢锁后再拒绝就必须手动回滚锁，
+					// 任何一条提前 continue 都会把机器人永久卡在"正在查询中"
+					lastTime := atomic.LoadInt64(&lastManualQueryAt)
+					if lastTime > 0 && (nowMs-lastTime) < manualCooldownSec*1000 {
+						remainSec := manualCooldownSec - (nowMs-lastTime)/1000
+						tgSend("answerCallbackQuery", map[string]interface{}{
+							"callback_query_id": cq.ID,
+							"text":              fmt.Sprintf("⚡ 刚刚才查过，请 %d 秒后再试~", remainSec),
+						})
+						continue
+					}
 
 					if !atomic.CompareAndSwapInt32(&isQueryingAtomic, 0, 1) {
 						tgSend("answerCallbackQuery", map[string]interface{}{
 							"callback_query_id": cq.ID,
 							"text":              "⏳ 正在查询中，请勿重复点击...",
-						})
-						continue
-					}
-
-					lastTime := atomic.LoadInt64(&lastManualQueryAt)
-					if lastTime > 0 && (nowMs-lastTime) < manualCooldownSec*1000 {
-						remainSec := manualCooldownSec - (nowMs-lastTime)/1000
-						atomic.StoreInt32(&isQueryingAtomic, 0)
-						tgSend("answerCallbackQuery", map[string]interface{}{
-							"callback_query_id": cq.ID,
-							"text":              fmt.Sprintf("⚡ 刚刚才查过，请 %d 秒后再试~", remainSec),
 						})
 						continue
 					}
@@ -2427,19 +2794,34 @@ func runTGDaemon() {
 
 					cookies := getCookies()
 					if len(cookies) > 0 {
-						go func(c string, cid string, msgID int64, reqMin int) {
+						// 回调必须刷新按钮所属的那个账号：callback_data 里带了下标，
+						// 越界（账号数变少）时回落 0
+						if accIdx >= len(cookies) {
+							accIdx = 0
+						}
+						multi := len(cookies) > 1
+						go func(c string, cid string, msgID int64, reqMin, idx int) {
 							defer atomic.StoreInt32(&isQueryingAtomic, 0)
-							res, err := fetchAndCalculate(c, 0, false, reqMin)
-							if err == nil {
-								tgSend("editMessageText", map[string]interface{}{
-									"chat_id":      cid,
-									"message_id":   msgID,
-									"text":         res.BotContent,
-									"parse_mode":   "HTML",
-									"reply_markup": buildTGInlineKeyboard(reqMin),
-								})
+							accTitle := fmt.Sprintf("账号 %d", idx+1)
+							res, err := fetchAndCalculate(c, idx, false, reqMin)
+							body := ""
+							if err != nil {
+								// 失败也要给出反馈：否则消息毫无变化，看着像卡死
+								body = fmt.Sprintf("❌ [%s] 查询失败: %s", accTitle, html.EscapeString(err.Error()))
+							} else {
+								body = res.BotContent
+								if multi {
+									body = fmt.Sprintf("👤 <b>[%s]</b>\n%s", accTitle, body)
+								}
 							}
-						}(cookies[0], chatID, cq.Message.MessageID, qMin)
+							tgSend("editMessageText", map[string]interface{}{
+								"chat_id":      cid,
+								"message_id":   msgID,
+								"text":         body,
+								"parse_mode":   "HTML",
+								"reply_markup": buildTGInlineKeyboard(reqMin, idx),
+							})
+						}(cookies[accIdx], chatID, cq.Message.MessageID, qMin, accIdx)
 					} else {
 						atomic.StoreInt32(&isQueryingAtomic, 0)
 					}
@@ -2505,6 +2887,10 @@ func checkAndSendAlert(res *QueryResult, accTitle string) {
 	var normPassed, freePassed bool
 	var triggerReasons []string
 	now := time.Now().In(cst).UnixMilli()
+	// 记录被覆盖前的冷却时间戳，三通道全部发送失败时用于回滚，
+	// 避免"告警丢了、冷却却已消耗"——监控工具最不能接受的双重失效
+	var prevAlertNorm, prevAlertFree int64
+	var cooldownWritten bool
 
 	_, lockErr := lockAndModifyStore(func(s *StoreData) bool {
 		acc := s.Accounts[res.AccKey]
@@ -2516,6 +2902,7 @@ func checkAndSendAlert(res *QueryResult, accTitle string) {
 		if acc.LastAlertNorm == 0 && acc.LastAlertTime > 0 {
 			acc.LastAlertNorm = acc.LastAlertTime
 		}
+		prevAlertNorm, prevAlertFree = acc.LastAlertNorm, acc.LastAlertFree
 
 		// 1. 通用跳点判定
 		if isNormTriggered {
@@ -2524,7 +2911,9 @@ func checkAndSendAlert(res *QueryResult, accTitle string) {
 				acc.LastAlertNorm = now
 				reason := fmt.Sprintf("%s +%s >= %s", normLabel, formatFlow(diffNormJudge), formatFlow(minNormUsage))
 				if diffNormJudge < minNormUsage && rateNorm >= minNormUsage {
-					reason = fmt.Sprintf("%s %s ≥ %s/%.0f分", normRateLabel, formatFlow(diffNormJudge/res.ElapsedMinutes), formatFlow(minNormUsage), rateWindowMinutes)
+					// 左右两边必须同口径：阈值是"每窗口"，所以速率也要换算成每窗口，
+					// 否则会打出"16.67M ≥ 50M/3分"这种左小于右的自相矛盾文案
+					reason = fmt.Sprintf("%s %s ≥ %s/%.0f分", normRateLabel, formatFlow(rateNorm), formatFlow(minNormUsage), rateWindowMinutes)
 				}
 				if isBypass {
 					reason += " [越级放行]"
@@ -2543,7 +2932,7 @@ func checkAndSendAlert(res *QueryResult, accTitle string) {
 				acc.LastAlertFree = now
 				reason := fmt.Sprintf("免流跳点 +%s >= %s", formatFlow(res.DiffFree), formatFlow(minFreeUsage))
 				if res.DiffFree < minFreeUsage && rateFree >= minFreeUsage {
-					reason = fmt.Sprintf("免流速率 %s ≥ %s/%.0f分", formatFlow(res.DiffFree/res.ElapsedMinutes), formatFlow(minFreeUsage), rateWindowMinutes)
+					reason = fmt.Sprintf("免流速率 %s ≥ %s/%.0f分", formatFlow(rateFree), formatFlow(minFreeUsage), rateWindowMinutes)
 				} else if freeSurgePass {
 					reason += " [显著加大越级]"
 				}
@@ -2555,6 +2944,7 @@ func checkAndSendAlert(res *QueryResult, accTitle string) {
 		}
 
 		allowSend = normPassed || freePassed
+		cooldownWritten = allowSend
 		return allowSend
 	})
 
@@ -2583,33 +2973,63 @@ func checkAndSendAlert(res *QueryResult, accTitle string) {
 
 		finalAutoTitle := res.AutoTitle
 		finalAutoContent := prefix + res.AutoContent
-		finalBotContent := strings.Replace(
-			res.BotContent,
-			"⚡ <b>联通实时跳点播报</b>",
-			prefix+"<b>联通实时跳点播报</b>",
-			1,
-		)
+		// 状态前缀直接前插：不能只替换默认标题字面量，
+		// 否则用户自定义了 bot_title 后 🔴/🟡/🟢 前缀会静默消失
+		finalBotContent := res.BotContent
+		if prefix != "" {
+			if strings.HasPrefix(finalBotContent, "⚡ <b>联通实时跳点播报</b>") {
+				finalBotContent = strings.Replace(finalBotContent,
+					"⚡ <b>联通实时跳点播报</b>", prefix+"<b>联通实时跳点播报</b>", 1)
+			} else {
+				finalBotContent = prefix + finalBotContent
+			}
+		}
 
 		fmt.Printf("🚀 [%s] 触发报警 (%s)，发送通知！\n", accTitle, strings.Join(triggerReasons, " | "))
-		sendDingTalk(finalAutoTitle, finalAutoContent)
 
 		store := loadStoreSafe()
 		owner := tgUserID
 		if owner == "" {
 			owner = store.OwnerID
 		}
+		useTG := tgBotToken != "" && owner != ""
+		useDaidai := shouldSendDaidaiNotify()
+		anyConfigured := ddBotToken != "" || useTG || useDaidai
 
-		if tgBotToken != "" && owner != "" {
-			tgSend("sendMessage", map[string]interface{}{
+		anySent := sendDingTalk(finalAutoTitle, finalAutoContent)
+		if useTG {
+			if tgSend("sendMessage", map[string]interface{}{
 				"chat_id":      owner,
 				"text":         finalBotContent,
 				"parse_mode":   "HTML",
-				"reply_markup": buildTGInlineKeyboard(0),
-			})
+				"reply_markup": buildTGInlineKeyboard(0, res.AccountIndex),
+			}) {
+				anySent = true
+			}
+		}
+		if useDaidai {
+			if sendDaidaiNotify(finalAutoTitle, finalAutoContent) {
+				anySent = true
+			}
 		}
 
-		if shouldSendDaidaiNotify() {
-			sendDaidaiNotify(finalAutoTitle, finalAutoContent)
+		// 已配置通道但全部失败 → 回滚冷却时间戳，让下一轮可以补报。
+		// 未配置任何通道时不回滚：那是用户主动选择静默，不是发送故障。
+		if anyConfigured && !anySent && cooldownWritten {
+			fmt.Println("⚠️ [推送] 所有通道均发送失败，回滚冷却时间戳以便下轮补报")
+			_, _ = lockAndModifyStore(func(s *StoreData) bool {
+				acc := s.Accounts[res.AccKey]
+				if acc == nil {
+					return false
+				}
+				if normPassed && acc.LastAlertNorm == now {
+					acc.LastAlertNorm = prevAlertNorm
+				}
+				if freePassed && acc.LastAlertFree == now {
+					acc.LastAlertFree = prevAlertFree
+				}
+				return true
+			})
 		}
 	} else if !isNormTriggered && !isFreeTriggered {
 		fmt.Printf("⏳ [%s] 本次%s(+%s / 阈值 %s)与免流(+%s / 阈值 %s)均未达标，静默不扰。\n",
@@ -2622,6 +3042,9 @@ func checkAndSendAlert(res *QueryResult, accTitle string) {
 // ======================== 主入口 (多账号轮询 + 三色前缀精准推送) ========================
 
 func main() {
+	// 升级路径：旧版凭据在独立文本文件里，必须先迁进 store.Creds 再做任何登录判定
+	migrateLegacyCreds()
+
 	if len(os.Args) > 1 {
 		if os.Args[1] == "stop" || os.Args[1] == "--stop" {
 			stopDaemon()
@@ -2684,11 +3107,8 @@ func main() {
 		fmt.Println("⚠️ [配置] 通用与免流跳点阈值均为 0，报警已关闭（只记录基线、不推送）")
 	}
 
-	// 🌟 多账号支持：并行轮询每个 Cookie（互不阻塞），并统计连续非认证失败次数
-	// 连续失败（非 Cookie 失效）≥3 次时触发一次故障告警，防真故障无感知
+	// 🌟 多账号支持：并行轮询每个 Cookie（互不阻塞）
 	var wg sync.WaitGroup
-	var failMu sync.Mutex
-	consecutiveFailures := 0
 	maxConsecutiveFailures, _ := strconv.Atoi(getEnv("ChinaUnicom_10010v4_max_failures", "3"))
 	if maxConsecutiveFailures <= 0 {
 		maxConsecutiveFailures = 3
@@ -2726,26 +3146,17 @@ func main() {
 				var authErr *AuthError
 				if errors.As(err, &authErr) {
 					notifyFault(fmt.Sprintf("[%s] Cookie 已失效且自动登录失败: %s", accTitle, authErr.Msg))
-					failMu.Lock()
-					consecutiveFailures = 0
-					failMu.Unlock()
+					// 认证失败走独立的 notifyFault 通道，只清本账号的网络失败计数
+					recordFailStreak(cookie, idx, false, 0, accTitle)
 				} else {
 					fmt.Printf("ℹ️ [%s] 为网络/网关临时波动 (非 Cookie 失效)，保持静默。\n", accTitle)
-					failMu.Lock()
-					consecutiveFailures++
-					if consecutiveFailures >= maxConsecutiveFailures {
-						notifyFault(fmt.Sprintf("连续 %d 次巡检查询失败（非 Cookie 失效），可能联通接口变更或网络故障", consecutiveFailures))
-						consecutiveFailures = 0
-					}
-					failMu.Unlock()
+					recordFailStreak(cookie, idx, true, maxConsecutiveFailures, accTitle)
 				}
 				return
 			}
 
-			// 查询成功即清零连续失败计数
-			failMu.Lock()
-			consecutiveFailures = 0
-			failMu.Unlock()
+			// 查询成功：清零本账号的连续失败计数
+			recordFailStreak(cookie, idx, false, 0, accTitle)
 
 			fmt.Println("\n============== 📣 [v4x] 自动报警模版预览 📣 ==============")
 			fmt.Printf("【%s】\n%s\n", res.AutoTitle, res.AutoContent)
@@ -2760,4 +3171,60 @@ func main() {
 	wg.Wait()
 
 	os.Exit(0)
+}
+
+// failStreakResetSec 超过这个时长没有新的失败，计数视为过期并重置。
+// 取 6 小时：足够跨过一段持续故障，又不会让隔天的偶发失败累加成误报。
+const failStreakResetSec = 6 * 3600
+
+// recordFailStreak 按账号累计/清零"连续非认证失败"次数，并在达阈值时告警一次。
+//
+// 计数必须落在 store（而非进程变量）：巡检进程由 cron 每 3 分钟重新拉起，
+// 进程内计数每次都从 0 开始，"连续 N 次失败"这条安全网实际上永远不会触发。
+// 计数按账号隔离，避免健康账号把故障账号的累计清零、掩盖真实故障。
+func recordFailStreak(cookie string, idx int, isFailure bool, threshold int, accTitle string) {
+	nowSec := time.Now().Unix()
+	var alertAt int
+
+	_, err := lockAndModifyStore(func(s *StoreData) bool {
+		key := migrateLegacyAccountKey(s, cookie, idx)
+		acc := s.Accounts[key]
+		if acc == nil {
+			acc = &AccountStore{}
+			s.Accounts[key] = acc
+		}
+
+		if !isFailure {
+			if acc.FailStreak == 0 && acc.FailStreakAt == 0 {
+				return false
+			}
+			acc.FailStreak = 0
+			acc.FailStreakAt = 0
+			return true
+		}
+
+		// 上次失败太久以前 → 不算"连续"，重新起算
+		if acc.FailStreakAt > 0 && nowSec-acc.FailStreakAt > failStreakResetSec {
+			acc.FailStreak = 0
+		}
+		acc.FailStreak++
+		acc.FailStreakAt = nowSec
+
+		if threshold > 0 && acc.FailStreak >= threshold {
+			alertAt = acc.FailStreak
+			acc.FailStreak = 0
+			acc.FailStreakAt = 0
+		}
+		return true
+	})
+	if err != nil {
+		fmt.Printf("⚠️ [%s] 失败计数写入失败: %v\n", accTitle, err)
+		return
+	}
+
+	// 告警在锁外发送，避免持锁期间做网络请求
+	if alertAt > 0 {
+		notifyFault(fmt.Sprintf("[%s] 连续 %d 次巡检查询失败（非 Cookie 失效），可能联通接口变更或网络故障",
+			accTitle, alertAt))
+	}
 }
