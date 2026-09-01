@@ -43,6 +43,11 @@
 | `ChinaUnicom_10010v4_cooldown` | 通用跳点报警冷却时间（秒） | 否 | `0` (不限制) |
 | `ChinaUnicom_10010v4_free_cooldown` | 免流跳点报警冷却时间（秒） | 否 | `1800` (30分钟) |
 | `ChinaUnicom_10010v4_bot_minutes` | **机器人主动查询**默认对比时长（分钟） | 否 | `30` (默认对比 30 分钟前) |
+| `ChinaUnicom_10010v4_free_keywords` | 自定义**免流判定关键词**（逗号/顿号/竖线分隔，`flowType` 缺省时与默认关键词叠加生效，新套餐免改代码） | 否 | 留空 |
+| `ChinaUnicom_10010v4_exclude_keywords` | **排除名单**关键词（逗号/顿号/竖线分隔，命中的明细如日租宝/赠款不参与任何统计） | 否 | 留空 |
+| `ChinaUnicom_10010v4_normal_limited_only` | `1` = 通用阈值/速率/越级判定**仅统计"通用有限池"增量**（排除不限量池稀释与虚增，展示口径不变） | 否 | `0` |
+| `ChinaUnicom_10010v4_history_hours` | 历史快照保留时长（小时，加大可支持更长 `/diff` 回溯，上限 720） | 否 | `24` |
+| `ChinaUnicom_10010v4_debug` | `1` = 打印每条流量明细的 `flowType`/分桶结果（DEBUG-分流），用于校准分类规则 | 否 | `0` |
 | `TG_BOT_TOKEN` | Telegram Bot Token | 否 | `1234567890:ABCdefGhIJKlmNoPQRsTUVwxyZ...` |
 | `TG_USER_ID` | Telegram 接收者 User ID | 否 | `987654321` |
 | `TG_API_HOST` | Telegram API 反代地址（国内服务器推荐） | 否 | `https://api.telegram.org` |

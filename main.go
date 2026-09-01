@@ -101,6 +101,8 @@ type QueryResult struct {
 	ElapsedMinutes float64
 	// 本次是否为暴涨防抖静默轮（仅记录基线，不推送）
 	SurgeSkipped bool
+	// 通用有限池增量（normal_limited_only 判定口径使用）
+	DiffNormLimit float64
 }
 
 // ======================== 全局变量与配置 ========================
@@ -138,6 +140,17 @@ var (
 	surgeThreshold float64 = 1024
 	// 【暴涨确认窗】首次静默后，在此窗口内再次暴涨才判定为真实跳点（秒）
 	surgeConfirmWindow int64 = 600
+
+	// 【判定口径】normalLimitedOnly=1 时通用通道仅用"通用有限池"增量参与阈值判定（展示口径不变）
+	normalLimitedOnly bool
+	// 【免流关键词】默认关键词之外的用户自定义免流判定关键词（flowType 缺省时生效）
+	freeKeywordsExtra []string
+	// 【排除名单】命中即跳过统计的干扰项关键词（如日租宝、赠款等）
+	excludeKeywords []string
+	// 【历史轨迹】快照保留时长（小时，默认 24；加大可支持更长 /diff 回溯）
+	historyKeepHours float64 = 24
+	// 【分流调试】ChinaUnicom_10010v4_debug=1 时打印每条明细的分桶结果
+	debugFlow bool
 
 	isQueryingAtomic  int32
 	lastManualQueryAt int64
@@ -296,6 +309,23 @@ func init() {
 	// 暴涨确认窗口（秒，默认 600 = 10 分钟）
 	if sw, _ := strconv.ParseInt(getEnv("ChinaUnicom_10010v4_surge_confirm_sec", "600"), 10, 64); sw > 0 {
 		surgeConfirmWindow = sw
+	}
+
+	// 分流调试开关（打印每条明细的 flowType/分桶结果，用于校准分类规则）
+	debugFlow = getEnv("ChinaUnicom_10010v4_debug", "0") == "1"
+
+	// 自定义免流关键词（逗号/顿号/竖线分隔），追加到默认关键词表（flowType 缺省时生效）
+	freeKeywordsExtra = splitKeywords(getEnv("ChinaUnicom_10010v4_free_keywords", ""))
+
+	// 排除名单（逗号/顿号/竖线分隔），命中的明细不参与任何统计（如日租宝、定向赠款等干扰项）
+	excludeKeywords = splitKeywords(getEnv("ChinaUnicom_10010v4_exclude_keywords", ""))
+
+	// 通用判定口径：1 = 仅"通用有限池"增量参与通用阈值/速率/越级判定（推荐含不限量池套餐开启）
+	normalLimitedOnly = getEnv("ChinaUnicom_10010v4_normal_limited_only", "0") == "1"
+
+	// 历史轨迹保留时长（小时，默认 24，上限 720 = 30 天）
+	if hh, err := strconv.ParseFloat(getEnv("ChinaUnicom_10010v4_history_hours", "24"), 64); err == nil && hh >= 1 && hh <= 720 {
+		historyKeepHours = hh
 	}
 }
 
@@ -517,6 +547,65 @@ func toFloat(v interface{}) float64 {
 		return f
 	}
 	return 0
+}
+
+// toFloatPresence 与 toFloat 相同，但额外返回字段是否存在（区分"字段缺省"与"真为 0"）
+func toFloatPresence(v interface{}) (float64, bool) {
+	if v == nil {
+		return 0, false
+	}
+	switch val := v.(type) {
+	case float64:
+		return val, true
+	case float32:
+		return float64(val), true
+	case int:
+		return float64(val), true
+	case int64:
+		return float64(val), true
+	case string:
+		f, err := strconv.ParseFloat(val, 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	}
+	return 0, false
+}
+
+// matchAnyKeyword 判断名称是否命中任意关键词
+func matchAnyKeyword(name string, keywords []string) bool {
+	for _, kw := range keywords {
+		if kw != "" && strings.Contains(name, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// splitKeywords 按逗号/中文逗号/顿号/竖线/分号拆分关键词，去空白与空项
+func splitKeywords(s string) []string {
+	fields := strings.FieldsFunc(s, func(r rune) bool {
+		return r == ',' || r == '，' || r == '、' || r == '|' || r == ';' || r == '；'
+	})
+	var out []string
+	for _, f := range fields {
+		f = strings.TrimSpace(f)
+		if f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// lastSnapshotBeforeMs 返回时间戳 <= ts 的最后一条历史记录下标（History 按时间升序），无则 -1
+func lastSnapshotBeforeMs(history []SnapshotRecord, ts int64) int {
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Timestamp <= ts {
+			return i
+		}
+	}
+	return -1
 }
 
 // ======================== 容灾存储引擎 ========================
@@ -886,6 +975,9 @@ func notifyFault(reason string) {
 
 // ======================== 核心数据查询与计算 ========================
 
+// defaultFreeKeywords flowType 缺省时的免流判定关键词（可通过 ChinaUnicom_10010v4_free_keywords 追加）
+var defaultFreeKeywords = []string{"免流", "定向", "直播", "畅视", "专享免费", "专属流量"}
+
 func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, diffMinutes int) (*QueryResult, error) {
 	apiURL := "https://m.client.10010.com/servicequerybusiness/operationservice/queryOcsPackageFlowLeftContentRevisedInJune"
 
@@ -951,10 +1043,28 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 		if res.Type == "flow" || res.Type == "MlFlowdetailsList" {
 			for _, item := range res.Details {
 				name := item.FeePolicyName + item.AddUpItemName
+
+				// 排除名单：命中的干扰项（如日租宝/赠款）不参与任何统计
+				if len(excludeKeywords) > 0 && matchAnyKeyword(name, excludeKeywords) {
+					if debugFlow {
+						fmt.Printf("⏭️ [DEBUG-分流] 命中排除名单，跳过: %s\n", name)
+					}
+					continue
+				}
+
 				tot := toFloat(item.Total)
 				u := toFloat(item.Use)
 				rem := toFloat(item.Remain)
-				isUnlimit := toFloat(item.Limited) == 1 || tot <= 0
+
+				// 无限量判定精细化：limited 字段显式存在时以其为准（1=无限量，0=有限量），
+				// 仅当字段缺省时才退回"total<=0 视为无限量"的旧规则，杜绝 total 字段缺失被误判为无限量
+				limitedVal, limitedPresent := toFloatPresence(item.Limited)
+				isUnlimit := false
+				if limitedPresent {
+					isUnlimit = limitedVal == 1
+				} else if tot <= 0 {
+					isUnlimit = true
+				}
 
 				// 兜底：若接口未返回 remain 且非无限量，由 total - use 计算
 				if rem <= 0 && tot > u && !isUnlimit {
@@ -968,15 +1078,17 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 				} else if item.FlowType == "2" || item.FlowType == "3" {
 					isFree = true
 				} else {
-					// 当 flowType 缺省或未知时，由套餐名称特征深度判定
-					isFree = strings.Contains(name, "免流") || strings.Contains(name, "定向") ||
-						strings.Contains(name, "直播") || strings.Contains(name, "畅视") ||
-						strings.Contains(name, "专享免费") || strings.Contains(name, "专属流量")
+					// 当 flowType 缺省或未知时，由套餐名称特征深度判定（默认关键词 + 用户自定义关键词）
+					isFree = matchAnyKeyword(name, defaultFreeKeywords) || matchAnyKeyword(name, freeKeywordsExtra)
 				}
 
-				if getEnv("ChinaUnicom_10010v4_debug", "0") == "1" {
-					fmt.Printf("🔍 [DEBUG-分流] 项: %s | flowType: %s | isFree: %v | isUnlimit: %v | tot: %.2f | use: %.2f | rem: %.2f\n",
-						name, item.FlowType, isFree, isUnlimit, tot, u, rem)
+				if debugFlow {
+					limitedStr := "缺省"
+					if limitedPresent {
+						limitedStr = strconv.FormatFloat(limitedVal, 'f', -1, 64)
+					}
+					fmt.Printf("🔍 [DEBUG-分流] 项: %s | flowType: %s | isFree: %v | isUnlimit: %v | limited: %s | tot: %.2f | use: %.2f | rem: %.2f\n",
+						name, item.FlowType, isFree, isUnlimit, limitedStr, tot, u, rem)
 				}
 
 				if isFree {
@@ -1092,8 +1204,8 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 				Snapshot:  currentSnap,
 			})
 
-			// 守卫 5: trim 只删超过 24 小时的最老记录
-			oneDayAgo := now.Add(-24 * time.Hour).UnixMilli()
+			// 守卫 5: trim 只删超过保留时长（historyKeepHours，默认 24 小时）的最老记录
+			oneDayAgo := now.Add(-time.Duration(historyKeepHours * float64(time.Hour))).UnixMilli()
 			if len(acc.History) > 0 && acc.History[0].Timestamp < oneDayAgo {
 				validIdx := 0
 				for i, h := range acc.History {
@@ -1109,7 +1221,15 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 
 			// 今日基线处理：仅跨天/首次时重置；同一天内用量倒退视为接口抖动，保留原基线
 			if acc.Today == nil || acc.TodayDate != todayZero {
-				acc.Today = currentSnap
+				// 跨天重置时优先回溯"昨天最后一条历史快照"作零点基线，
+				// 补齐任务在 00:00 空窗期未运行导致的今日用量少算（漏掉凌晨消耗）
+				base := currentSnap
+				if idx := lastSnapshotBeforeMs(acc.History, todayZero); idx >= 0 && acc.History[idx].Snapshot != nil {
+					base = acc.History[idx].Snapshot
+					fmt.Printf("🌅 [今日基线] 采用昨日最后快照 (%s) 作为零点基线，补齐凌晨空窗。\n",
+						time.UnixMilli(acc.History[idx].Timestamp).In(cst).Format("01-02 15:04"))
+				}
+				acc.Today = base
 				acc.TodayDate = todayZero
 			}
 
@@ -1438,6 +1558,7 @@ func fetchAndCalculate(cookie string, accountIndex int, updateBaseline bool, dif
 		DurationStr:    durationStr,
 		DiffNormal:     diffNorm,
 		DiffFree:       diffFree,
+		DiffNormLimit:  diffNormLimit,
 		TotalDiffMb:    totalDiff,
 		AutoTitle:      autoTitle,
 		AutoContent:    autoContent,
@@ -1752,8 +1873,8 @@ func runTGDaemon() {
 
 				if text == "/start" || text == "/help" {
 					tgSend("sendMessage", map[string]interface{}{
-						"chat_id":    chatID,
-						"text":       "👋 <b>[Go-v4x] 联通监控在线！</b>\n\n" +
+						"chat_id": chatID,
+						"text": "👋 <b>[Go-v4x] 联通监控在线！</b>\n\n" +
 							"💡 <b>菜单功能指南：</b>\n" +
 							"• <b>⚡ 实时跳点</b> (<code>/check</code>) : 对比上次自动巡检的实时跳点\n" +
 							"• <b>🔍 查询跳点</b> (<code>/diff</code>) : 回溯独立时长（如 5 分钟）对比差值\n" +
@@ -1975,17 +2096,27 @@ func checkAndSendAlert(res *QueryResult, accTitle string) {
 	}
 
 	// 双独立阈值判定（增量 + 速率双条件，速率按 rateWindowMinutes 窗口归一）
+	// 判定口径：normalLimitedOnly=1 时通用通道改用"通用有限池"增量，
+	// 排除不限量池（如专属不限量包）对通用跳点的稀释/虚增，展示口径保持不变
+	diffNormJudge := res.DiffNormal
+	normLabel := "通用跳点"
+	normRateLabel := "通用速率"
+	if normalLimitedOnly {
+		diffNormJudge = res.DiffNormLimit
+		normLabel = "通用跳点(有限池)"
+		normRateLabel = "通用速率(有限池)"
+	}
 	rateNorm := 0.0
 	rateFree := 0.0
 	if res.ElapsedMinutes > 0 {
-		rateNorm = res.DiffNormal / res.ElapsedMinutes * rateWindowMinutes
+		rateNorm = diffNormJudge / res.ElapsedMinutes * rateWindowMinutes
 		rateFree = res.DiffFree / res.ElapsedMinutes * rateWindowMinutes
 	}
-	isNormTriggered := minNormUsage > 0 && (res.DiffNormal >= minNormUsage || rateNorm >= minNormUsage)
+	isNormTriggered := minNormUsage > 0 && (diffNormJudge >= minNormUsage || rateNorm >= minNormUsage)
 	isFreeTriggered := minFreeUsage > 0 && (res.DiffFree >= minFreeUsage || rateFree >= minFreeUsage)
 
 	// 越级放行仅针对通用流量
-	isBypass := alertBypassMb > 0 && res.DiffNormal >= alertBypassMb
+	isBypass := alertBypassMb > 0 && diffNormJudge >= alertBypassMb
 
 	// 免流显著加大越级：冷却期内若跳点 ≥ 阈值×3，视为"显著加大"，允许再次推送
 	freeSurgePass := minFreeUsage > 0 && res.DiffFree >= minFreeUsage*3
@@ -2011,17 +2142,17 @@ func checkAndSendAlert(res *QueryResult, accTitle string) {
 			if isBypass || alertCooldown <= 0 || acc.LastAlertNorm == 0 || (now-acc.LastAlertNorm) >= alertCooldown.Milliseconds() {
 				normPassed = true
 				acc.LastAlertNorm = now
-				reason := fmt.Sprintf("通用跳点 +%s >= %s", formatFlow(res.DiffNormal), formatFlow(minNormUsage))
-				if res.DiffNormal < minNormUsage && rateNorm >= minNormUsage {
-					reason = fmt.Sprintf("通用速率 %s ≥ %s/%.0f分", formatFlow(res.DiffNormal/res.ElapsedMinutes), formatFlow(minNormUsage), rateWindowMinutes)
+				reason := fmt.Sprintf("%s +%s >= %s", normLabel, formatFlow(diffNormJudge), formatFlow(minNormUsage))
+				if diffNormJudge < minNormUsage && rateNorm >= minNormUsage {
+					reason = fmt.Sprintf("%s %s ≥ %s/%.0f分", normRateLabel, formatFlow(diffNormJudge/res.ElapsedMinutes), formatFlow(minNormUsage), rateWindowMinutes)
 				}
 				if isBypass {
 					reason += " [越级放行]"
 				}
 				triggerReasons = append(triggerReasons, reason)
 			} else {
-				fmt.Printf("⏳ [%s] 通用跳点已达标 (+%s)，但在冷却期内 (%s)，跳过该项推送\n",
-					accTitle, formatFlow(res.DiffNormal), cooldownText(alertCooldown))
+				fmt.Printf("⏳ [%s] %s已达标 (+%s)，但在冷却期内 (%s)，跳过该项推送\n",
+					accTitle, normLabel, formatFlow(diffNormJudge), cooldownText(alertCooldown))
 			}
 		}
 
@@ -2053,7 +2184,7 @@ func checkAndSendAlert(res *QueryResult, accTitle string) {
 		freePassed = isFreeTriggered
 		allowSend = isNormTriggered || isFreeTriggered
 		if isNormTriggered {
-			triggerReasons = append(triggerReasons, fmt.Sprintf("通用跳点 +%s [抢锁超时强制放行]", formatFlow(res.DiffNormal)))
+			triggerReasons = append(triggerReasons, fmt.Sprintf("%s +%s [抢锁超时强制放行]", normLabel, formatFlow(diffNormJudge)))
 		}
 		if isFreeTriggered {
 			triggerReasons = append(triggerReasons, fmt.Sprintf("免流跳点 +%s [抢锁超时强制放行]", formatFlow(res.DiffFree)))
@@ -2101,9 +2232,9 @@ func checkAndSendAlert(res *QueryResult, accTitle string) {
 			sendDaidaiNotify(finalAutoTitle, finalAutoContent)
 		}
 	} else if !isNormTriggered && !isFreeTriggered {
-		fmt.Printf("⏳ [%s] 本次通用(+%s / 阈值 %s)与免流(+%s / 阈值 %s)均未达标，静默不扰。\n",
-			accTitle,
-			formatFlow(res.DiffNormal), thresholdText(minNormUsage),
+		fmt.Printf("⏳ [%s] 本次%s(+%s / 阈值 %s)与免流(+%s / 阈值 %s)均未达标，静默不扰。\n",
+			accTitle, normLabel,
+			formatFlow(diffNormJudge), thresholdText(minNormUsage),
 			formatFlow(res.DiffFree), thresholdText(minFreeUsage))
 	}
 }
