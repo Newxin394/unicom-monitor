@@ -61,6 +61,69 @@ func TestParseRefreshCallback(t *testing.T) {
 	}
 }
 
+// 键盘内不得出现两个 callback_data 相同的按钮（外观不同、行为一样会让人以为坏了）。
+func TestInlineKeyboardNoDuplicateActions(t *testing.T) {
+	botDiffMinutes = 30
+	for _, diffMin := range []int{-1, 0, 5, 30, 60} {
+		kb := buildTGInlineKeyboard(diffMin, 0)
+		rows := kb["inline_keyboard"].([][]map[string]string)
+		seen := map[string]string{}
+		total := 0
+		for _, row := range rows {
+			if len(row) == 0 {
+				t.Errorf("diffMin=%d 出现空行", diffMin)
+			}
+			for _, k := range row {
+				total++
+				if prev, dup := seen[k["callback_data"]]; dup {
+					t.Errorf("diffMin=%d 重复动作 %s：%q 与 %q", diffMin, k["callback_data"], prev, k["text"])
+				}
+				seen[k["callback_data"]] = k["text"]
+			}
+		}
+		if total < 2 {
+			t.Errorf("diffMin=%d 按钮过少 (%d)", diffMin, total)
+		}
+		// 套餐总余量入口必须始终可达
+		if _, ok := seen["refresh_-1_0"]; !ok {
+			t.Errorf("diffMin=%d 缺少套餐总余量入口", diffMin)
+		}
+	}
+}
+
+// diffMin 等于 botDiffMinutes 时，两个同义键合并且沿用 ⚡ 文案。
+func TestInlineKeyboardMergesQuickAndRefresh(t *testing.T) {
+	botDiffMinutes = 30
+	kb := buildTGInlineKeyboard(30, 0)
+	rows := kb["inline_keyboard"].([][]map[string]string)
+	if len(rows) != 1 || len(rows[0]) != 2 {
+		t.Fatalf("期望合并为单行两键，实际 %v", rows)
+	}
+	if rows[0][0]["text"] != "⚡ 实时跳点" || rows[0][0]["callback_data"] != "refresh_30_0" {
+		t.Fatalf("首键应为 ⚡ 实时跳点/refresh_30_0，实际 %v", rows[0][0])
+	}
+}
+
+// ⚡ 快捷键的 callback_data 必须跟随 botDiffMinutes，否则按钮与指令行为分叉。
+func TestInlineKeyboardQuickKeyFollowsBotMinutes(t *testing.T) {
+	orig := botDiffMinutes
+	defer func() { botDiffMinutes = orig }()
+
+	botDiffMinutes = 45
+	kb := buildTGInlineKeyboard(0, 1)
+	found := ""
+	for _, row := range kb["inline_keyboard"].([][]map[string]string) {
+		for _, k := range row {
+			if k["text"] == "⚡ 实时跳点" {
+				found = k["callback_data"]
+			}
+		}
+	}
+	if found != "refresh_45_1" {
+		t.Fatalf("⚡ 键 callback_data = %q，期望 refresh_45_1", found)
+	}
+}
+
 // 指纹按行计算：改一行不应影响另一行的指纹。
 func TestEnvCredFingerprintPerLine(t *testing.T) {
 	a1 := envCredFingerprint("cookieA", "tokA")
