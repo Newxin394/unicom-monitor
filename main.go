@@ -1393,8 +1393,31 @@ func runTGDaemon() {
 		cancel()
 		cleanup()
 	}()
+	// 🌟 启动后台自动回环巡检引擎（默认每 3 分钟自动巡检一次，达到阈值主动推钉钉+TG；可由 AUTO_CHECK_INTERVAL_MIN 自定义）
+	loopMin, _ := strconv.Atoi(getEnv("AUTO_CHECK_INTERVAL_MIN", "3"))
+	if loopMin > 0 {
+		go func() {
+			fmt.Printf("🔄 [Go-v4x] 启动后台回环巡检引擎 (每 %d 分钟巡检一次)\n", loopMin)
+			ticker := time.NewTicker(time.Duration(loopMin) * time.Minute)
+			defer ticker.Stop()
 
-	// 守护进程专职负责 Telegram 交互长轮询，定时巡检统一由外部 Cron 驱动并兼顾守护进程保活
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					cks := getCookies()
+					for idx, c := range cks {
+						title := fmt.Sprintf("账号 %d", idx+1)
+						r, err := fetchAndCalculate(c, idx, true, 0)
+						if err == nil && r != nil {
+							checkAndSendAlert(r, title)
+						}
+					}
+				}
+			}
+		}()
+	}
 
 	store := loadStoreSafe()
 	var offset int64 = 0
