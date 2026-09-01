@@ -43,11 +43,11 @@
 | `ChinaUnicom_10010v4_cooldown` | 通用跳点报警冷却时间（秒） | 否 | `0` (不限制) |
 | `ChinaUnicom_10010v4_free_cooldown` | 免流跳点报警冷却时间（秒） | 否 | `1800` (30分钟) |
 | `ChinaUnicom_10010v4_bot_minutes` | **机器人主动查询**默认对比时长（分钟） | 否 | `30` (默认对比 30 分钟前) |
-| `TG_BOT_TOKEN` | Telegram Bot Token | 否 | `7014392040:AAF4...` |
-| `TG_USER_ID` | Telegram 接收者 User ID | 否 | `1033435406` |
+| `TG_BOT_TOKEN` | Telegram Bot Token | 否 | `7011234040:AAF4...` |
+| `TG_USER_ID` | Telegram 接收者 User ID | 否 | `12345678` |
 | `TG_API_HOST` | Telegram API 反代地址（国内服务器推荐） | 否 | `https://api.telegram.org` |
-| `DD_BOT_TOKEN` | 钉钉机器人 Webhook 中的 `access_token` | 否 | `0302c0d50b6...` |
-| `DD_BOT_SECRET` | 钉钉机器人安全设置中的【加签】Secret | 否 | `SECb38f089...` |
+| `DD_BOT_TOKEN` | 钉钉机器人 Webhook 中的 `access_token` | 否 | `0302c06...` |
+| `DD_BOT_SECRET` | 钉钉机器人安全设置中的【加签】Secret | 否 | `SECb39...` |
 | `ENABLE_DAIDAI_NOTIFY` | 强制开启呆呆面板原生通知推送（`1` 为开启） | 否 | `0` (默认未配专属 TG/钉钉时自动兜底启用) |
 
 > 💬 **多渠道与面板推送机制（智能防冲突）**：
