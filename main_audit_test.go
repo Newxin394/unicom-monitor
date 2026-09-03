@@ -234,3 +234,38 @@ func TestPickLegacyAccountPrefersRichest(t *testing.T) {
 		t.Fatalf("未选中历史最丰富的条目: key=%s", key)
 	}
 }
+
+// 每日日报：窗口边界与消耗/最大跳点计算。
+func TestDailySummaryWindowAndTotals(t *testing.T) {
+	// dayStart=1000ms 起，每 10 分钟一个快照，模拟一个"昨日"
+	dayStart, dayEnd := int64(1000), int64(1000+86400000)
+	mk := func(ts int64, norm, free float64) SnapshotRecord {
+		return SnapshotRecord{Timestamp: ts, Snapshot: &UsageSnapshot{NormalUsed: norm, FreeUsed: free}}
+	}
+	hist := []SnapshotRecord{
+		mk(999, 100, 1000),             // 窗口前 (前一天尾量, 不参与)
+		mk(dayStart, 100, 1000),         // 昨日首快照 = 基线
+		mk(dayStart+600000, 103, 1080),  // +3M / +80M
+		mk(dayStart+1200000, 104, 1200), // +1M / +120M  ← 免流最大跳点 120M
+		mk(dayEnd-1, 111.94, 2117.25),   // 窗口内最后一个 (昨日末日) +7.94M / +917.25M → 通用最大跳点
+		mk(dayEnd, 200, 3000),           // 窗口后 (今日, 不参与)
+	}
+	norm, free, mN, mF, mAt := dailySummary(hist, dayStart, dayEnd)
+	const eps = 1e-6
+	if norm-11.94 > eps || 11.94-norm > eps || free-1117.25 > eps || 1117.25-free > eps {
+		t.Fatalf("汇总不符: norm=%v free=%v (期望 11.94 / 1117.25)", norm, free)
+	}
+	if mN-7.94 > eps || 7.94-mN > eps || mF-917.25 > eps || 917.25-mF > eps {
+		t.Fatalf("最大跳点不符: norm=%v free=%v (期望 7.94 / 917.25)", mN, mF)
+	}
+	if mAt == "" {
+		t.Fatalf("通用最大跳点时刻为空")
+	}
+	// 空窗口 / 快照不足 2 条
+	if n, f, _, _, _ := dailySummary(hist, dayEnd, dayEnd+86400000); n != 0 || f != 0 {
+		t.Fatalf("空窗口应返回 0: norm=%v free=%v", n, f)
+	}
+	if n, f, _, _, _ := dailySummary(nil, dayStart, dayEnd); n != 0 || f != 0 {
+		t.Fatalf("空历史应返回 0: norm=%v free=%v", n, f)
+	}
+}

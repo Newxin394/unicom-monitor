@@ -103,6 +103,11 @@ type StoreData struct {
 	LastFaultAlertAt int64                    `json:"lastFaultAlertAt"`
 	Cookies          []string                 `json:"cookies,omitempty"`
 
+	// 【每日日报】最后一次成功推送日报的"日"（CST 日起始 Unix 秒 / 86400），防同天重发。
+	// 日报是"整天一次性"推送而非滚动告警：进程由 cron 每 3 分钟冷启动，
+	// 不落库的话窗口内每轮都会重发一遍。
+	LastDailyReportDay int64 `json:"lastDailyReportDay,omitempty"`
+
 	// 【自动登录】按手机号索引的凭据表，是轮换后凭据的唯一权威来源。
 	// 用 map 而非按行数组：换新 Cookie 后手机号不变，既不会因行号错位串号，
 	// 又天然与 flock 临界区共享同一份 JSON，避免独立文件的锁外读改写竞态。
@@ -183,6 +188,8 @@ var (
 
 	// 【判定口径】normalLimitedOnly=1 时通用通道仅用"通用有限池"增量参与阈值判定（展示口径不变）
 	normalLimitedOnly bool
+	// 【每日日报】ChinaUnicom_10010v4_daily_report=1 时，凌晨窗口内自动推送昨日流量汇总（默认 0 关闭）
+	dailyReportEnabled bool
 	// 【免流关键词】默认关键词之外的用户自定义免流判定关键词（flowType 缺省时生效）
 	freeKeywordsExtra []string
 	// 【排除名单】命中即跳过统计的干扰项关键词（如日租宝、赠款等）
@@ -379,6 +386,9 @@ func init() {
 
 	// 通用判定口径：1 = 仅"通用有限池"增量参与通用阈值/速率/越级判定（推荐含不限量池套餐开启）
 	normalLimitedOnly = getEnv("ChinaUnicom_10010v4_normal_limited_only", "0") == "1"
+
+	// 【每日日报】1 = 开启凌晨自动日报（默认 0 关闭）。见 sendDailyReportIfDue。
+	dailyReportEnabled = getEnv("ChinaUnicom_10010v4_daily_report", "0") == "1"
 
 	// 历史轨迹保留时长（小时，默认 24，上限 720 = 30 天）
 	if hh, err := strconv.ParseFloat(getEnv("ChinaUnicom_10010v4_history_hours", "24"), 64); err == nil && hh >= 1 && hh <= 720 {
@@ -1592,6 +1602,199 @@ func notifyFault(reason string) {
 	if shouldSendDaidaiNotify() {
 		sendDaidaiNotify(title, body)
 	}
+}
+
+// ======================== 每日流量日报 ========================
+
+// dailyReportWindowMin 日报发送窗口：只在 00:00 后的前 N 分钟内发送。
+// cron 每 3 分钟一轮，15 分钟覆盖 5 轮，足够容下一次任务漏跑。
+// 之所以必须限定窗口：history 仅保留 24h（默认），凌晨越晚发送，
+// 昨日 0 点附近的快照被裁剪得越多、数字越失真；过窗未发则当天放弃。
+const dailyReportWindowMin = 15
+
+// dailySummary 纯计算：[dayStartMs, dayEndMs) 窗口内的用量汇总。
+// 返回：通用/免流当日总消耗、各自最大单次跳点、通用最大跳点发生时刻(HH:MM)。
+// 首快照为窗口内第一次巡检，基线含前日尾量，误差 ≤ 一个巡检周期（与 python 版口径一致）。
+func dailySummary(hist []SnapshotRecord, dayStartMs, dayEndMs int64) (norm, free, maxNormJ, maxFreeJ float64, maxNormAt string) {
+	var win []SnapshotRecord
+	for _, h := range hist {
+		if h.Timestamp >= dayStartMs && h.Timestamp < dayEndMs && h.Snapshot != nil {
+			win = append(win, h)
+		}
+	}
+	if len(win) < 2 {
+		return 0, 0, 0, 0, ""
+	}
+	first, last := win[0].Snapshot, win[len(win)-1].Snapshot
+	norm = last.NormalUsed - first.NormalUsed
+	free = last.FreeUsed - first.FreeUsed
+	if norm < 0 {
+		norm = 0
+	}
+	if free < 0 {
+		free = 0
+	}
+	for i := 1; i < len(win); i++ {
+		dn := win[i].Snapshot.NormalUsed - win[i-1].Snapshot.NormalUsed
+		df := win[i].Snapshot.FreeUsed - win[i-1].Snapshot.FreeUsed
+		if dn > maxNormJ {
+			maxNormJ = dn
+			maxNormAt = time.UnixMilli(win[i].Timestamp).In(cst).Format("15:04")
+		}
+		if df > maxFreeJ {
+			maxFreeJ = df
+		}
+	}
+	return norm, free, maxNormJ, maxFreeJ, maxNormAt
+}
+
+// buildDailyReportCard 拼装日报文案（纯文本，TG/钉钉/呆呆三通道通用）。
+func buildDailyReportCard(dateStr string, acc *AccountStore, norm, free, maxNormJ, maxFreeJ float64, maxNormAt string) string {
+	var b strings.Builder
+	b.WriteString("📊 联通流量日报 ")
+	b.WriteString(dateStr)
+	b.WriteString("\n==========================\n")
+	jumpAt := maxNormAt
+	if jumpAt == "" {
+		jumpAt = "--"
+	}
+	fmt.Fprintf(&b, "• 昨日通用: %s (最大跳点 +%s @%s)\n", formatFlow(norm), formatFlow(maxNormJ), jumpAt)
+	fmt.Fprintf(&b, "• 昨日免流: %s (最大跳点 +%s)\n", formatFlow(free), formatFlow(maxFreeJ))
+	if acc != nil && acc.Last != nil {
+		fmt.Fprintf(&b, "• 当前通用已用: %s\n", formatFlow(acc.Last.NormalUsed))
+		fmt.Fprintf(&b, "• 当前免流已用: %s\n", formatFlow(acc.Last.FreeUsed))
+	}
+	b.WriteString("==========================")
+	return b.String()
+}
+
+// sendDailyReportIfDue 凌晨窗口内推送昨日日报（env 开关 ChinaUnicom_10010v4_daily_report=1）。
+// force=true 时跳过窗口/开关判定立即发送（--daily 手动测试用），且不占用当天名额。
+// 只读 history、不查询联通接口、不动巡检基线；幂等由 store.lastDailyReportDay 保证。
+func sendDailyReportIfDue(force bool) {
+	now := time.Now().In(cst)
+	today0 := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, cst)
+	today0Ms := today0.UnixMilli()
+	yStart, yEnd := today0Ms-86400000, today0Ms
+	today := today0.Unix() / 86400
+
+	if !force {
+		if !dailyReportEnabled {
+			return
+		}
+		// 窗口判定：仅 00:00–00:15 之间发送
+		if now.Hour() != 0 || now.Minute() >= dailyReportWindowMin {
+			return
+		}
+	}
+
+	store := loadStoreSafe()
+	if store == nil || len(store.Accounts) == 0 {
+		if force {
+			fmt.Println("⚠️ [日报] store 为空或不可读，无法生成日报")
+		}
+		return
+	}
+
+	// 幂等认领：当天已发过（且非 force）则跳过
+	if !force && store.LastDailyReportDay == today {
+		return
+	}
+
+	dateStr := today0.AddDate(0, 0, -1).Format("2006-01-02")
+	type card struct {
+		key     string
+		title   string
+		content string
+	}
+	var cards []card
+	for key, acc := range store.Accounts {
+		if acc == nil {
+			continue
+		}
+		norm, free, mN, mF, mAt := dailySummary(acc.History, yStart, yEnd)
+		if len(acc.History) == 0 && force {
+			continue // force 模式下无数据的账号跳过，避免刷空卡
+		}
+		content := buildDailyReportCard(dateStr, acc, norm, free, mN, mF, mAt)
+		// 标题带账号尾号，多账号时收件端可区分
+		title := fmt.Sprintf("📊 联通流量日报 %s", dateStr)
+		if n := len(store.Accounts); n > 1 {
+			title += fmt.Sprintf(" (%s)", keySuffix(key, n))
+		}
+		cards = append(cards, card{key: key, title: title, content: content})
+	}
+	if len(cards) == 0 {
+		if force {
+			fmt.Println("⚠️ [日报] 没有任何账号含昨日快照，无法生成日报")
+		}
+		return
+	}
+
+	// 认领当天名额（先占坑后发送；全通道失败则回滚，下一轮窗口内补发）
+	claimed := false
+	if !force {
+		_, err := lockAndModifyStore(func(s *StoreData) bool {
+			if s.LastDailyReportDay == today {
+				return false // 并发竞态下另一进程刚发过
+			}
+			s.LastDailyReportDay = today
+			claimed = true
+			return true
+		})
+		if err != nil || !claimed {
+			return
+		}
+	}
+
+	owner := tgUserID
+	if owner == "" {
+		owner = store.OwnerID
+	}
+	useTG := tgBotToken != "" && owner != ""
+	useDaidai := shouldSendDaidaiNotify()
+	anyConfigured := ddBotToken != "" || useTG || useDaidai
+	anySent := false
+
+	for _, c := range cards {
+		fmt.Printf("📤 [日报] 推送 %s\n%s\n", c.title, c.content)
+		if sendDingTalk(c.title, c.content) {
+			anySent = true
+		}
+		if useTG {
+			if tgSend("sendMessage", map[string]interface{}{
+				"chat_id": owner,
+				"text":    c.content,
+			}) {
+				anySent = true
+			}
+		}
+		if useDaidai {
+			if sendDaidaiNotify(c.title, c.content) {
+				anySent = true
+			}
+		}
+	}
+
+	// 与跳点告警同一哲学：配置了通道但全部失败 → 回滚名额，窗口内下一轮补发
+	if !force && anyConfigured && !anySent && claimed {
+		fmt.Println("⚠️ [日报] 所有通道均发送失败，回滚当天名额以便下轮补发")
+		_, _ = lockAndModifyStore(func(s *StoreData) bool {
+			if s.LastDailyReportDay == today {
+				s.LastDailyReportDay = 0
+			}
+			return true
+		})
+	}
+}
+
+// keySuffix 从账号 key 提取可读尾号（acc_10e4e436 → e4e436），key 异常时回退序号。
+func keySuffix(key string, total int) string {
+	s := strings.TrimPrefix(key, "acc_")
+	if len(s) >= 4 {
+		return s[len(s)-6:]
+	}
+	return key
 }
 
 // ======================== 核心数据查询与计算 ========================
@@ -3090,6 +3293,11 @@ func main() {
 			runTGDaemon()
 			os.Exit(0)
 		}
+		// 手动强制推送一次日报（跳过窗口/开关/名额判定，不影响当天自动日报）
+		if os.Args[1] == "daily" || os.Args[1] == "--daily" {
+			sendDailyReportIfDue(true)
+			os.Exit(0)
+		}
 	}
 
 	if tgBotToken != "" {
@@ -3131,6 +3339,11 @@ func main() {
 			fmt.Println("⚠️ [安全] 未设 TG_USER_ID / TG_BIND_SECRET：当前已禁止任何陌生人自动认主")
 		}
 	}
+
+	// 【每日日报】凌晨窗口内首轮回城时推送昨日汇总（ChinaUnicom_10010v4_daily_report=1 开启）。
+	// 置于 Cookie 校验之前：日报只依赖 store 的 history，与本次巡检成败解耦；
+	// 即便 Cookie 失效走 os.Exit(1)，当天的日报也已送达，不会因登录故障静默丢失。
+	sendDailyReportIfDue(false)
 
 	cookies := getCookies()
 	if len(cookies) == 0 {
