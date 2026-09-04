@@ -1401,6 +1401,7 @@ func tgSend(method string, payload map[string]interface{}) bool {
 		return false
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -2528,6 +2529,28 @@ func stopDaemon() {
 
 // ======================== 后台 TG 响应协程 ========================
 
+// sanitizeTGCommand 清洗 Telegram 客户端发来的特殊控制字符、Emoji 变体选择符和 Bot 后缀
+func sanitizeTGCommand(text string) string {
+	// 1. 去除 Emoji 变体选择符 \uFE0F 与 \uFE0E (部分客户端/输入法会自动附带)
+	t := strings.ReplaceAll(text, "\ufe0f", "")
+	t = strings.ReplaceAll(t, "\ufe0e", "")
+	// 2. 去除全角/不间断空格
+	t = strings.ReplaceAll(t, "\u00a0", " ")
+	t = strings.ReplaceAll(t, "\u3000", " ")
+	// 3. 去除 /cmd@BotName 后缀（支持群聊或点击联想自动补全的命令）
+	if strings.HasPrefix(t, "/") {
+		if atIdx := strings.Index(t, "@"); atIdx != -1 {
+			spaceIdx := strings.Index(t, " ")
+			if spaceIdx != -1 && spaceIdx > atIdx {
+				t = t[:atIdx] + t[spaceIdx:]
+			} else if spaceIdx == -1 {
+				t = t[:atIdx]
+			}
+		}
+	}
+	return strings.TrimSpace(t)
+}
+
 // jumpLabelRe 匹配底部快捷键盘「🔍 30分钟跳点」样式文本，跟随标签里的数字。
 var jumpLabelRe = regexp.MustCompile(`^🔍\s*(\d+)\s*分钟跳点$`)
 
@@ -2696,7 +2719,12 @@ func runTGDaemon() {
 	// 全部重放一遍（历史"查跳点"被批量执行、消息刷屏）。
 	bootstrapOffset := func() bool {
 		reqURL := fmt.Sprintf("%s/bot%s/getUpdates?offset=-1&timeout=0", tgApiHost, tgBotToken)
-		r, e := httpClient.Get(reqURL)
+		req, reqErr := http.NewRequest("GET", reqURL, nil)
+		if reqErr != nil {
+			return false
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+		r, e := httpClient.Do(req)
 		if e != nil {
 			return false
 		}
@@ -2750,10 +2778,18 @@ func runTGDaemon() {
 			time.Sleep(2 * time.Second)
 			continue
 		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
 
 		resp, err := tgPollClient.Do(req)
 		if err != nil {
 			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			fmt.Printf("⚠️ [TG 轮询异常] HTTP %d\n", resp.StatusCode)
+			resp.Body.Close()
+			time.Sleep(3 * time.Second)
 			continue
 		}
 
@@ -2817,7 +2853,13 @@ func runTGDaemon() {
 				}
 
 				chatID := strconv.FormatInt(msg.Chat.ID, 10)
+				fromID := ""
+				if msg.From != nil {
+					fromID = strconv.FormatInt(msg.From.ID, 10)
+				}
 				text := strings.TrimSpace(msg.Text)
+				cleanText := sanitizeTGCommand(text)
+				normNoSpace := strings.ReplaceAll(cleanText, " ", "")
 
 				curStore := loadStoreSafe()
 				owner := tgUserID
@@ -2826,9 +2868,13 @@ func runTGDaemon() {
 				}
 
 				if owner == "" && tgBindSecret != "" {
-					if text == "/bind "+tgBindSecret {
+					if cleanText == "/bind "+tgBindSecret {
+						bindID := fromID
+						if bindID == "" {
+							bindID = chatID
+						}
 						_, _ = lockAndModifyStore(func(s *StoreData) bool {
-							s.OwnerID = chatID
+							s.OwnerID = bindID
 							return true
 						})
 						tgSend("sendMessage", map[string]interface{}{
@@ -2839,15 +2885,15 @@ func runTGDaemon() {
 					}
 				}
 
-				// 守卫 1: 非白名单授权用户一律跳过
-				if chatID != owner {
+				// 守卫 1: 权限检查（私聊 chatID 或群聊 fromID 匹配 owner）
+				if chatID != owner && fromID != owner {
 					continue
 				}
 
 				var isQueryCmd bool
 				var queryMinutes int = 0
 
-				if text == "/start" || text == "/help" {
+				if cleanText == "/start" || cleanText == "/help" {
 					tgSend("sendMessage", map[string]interface{}{
 						"chat_id": chatID,
 						"text": "👋 <b>[Go-v4x] 联通监控在线！</b>\n\n" +
@@ -2868,24 +2914,24 @@ func runTGDaemon() {
 							"resize_keyboard": true,
 						},
 					})
-				} else if text == "/check" || text == "⚡ 实时跳点" || text == "⚡ 实时查跳点" {
+				} else if cleanText == "/check" || strings.Contains(normNoSpace, "实时跳点") || strings.Contains(normNoSpace, "实时查跳点") {
 					// ⚡ = 巡检查询：对比上次自动巡检（约 3 分钟窗口）
 					isQueryCmd = true
 					queryMinutes = 0
-				} else if text == "📦 套餐总余量" || text == "/total" {
+				} else if cleanText == "/total" || strings.Contains(normNoSpace, "套餐总余量") || strings.Contains(normNoSpace, "总余量") {
 					isQueryCmd = true
 					queryMinutes = -1
-				} else if text == "/diff" || text == "🔍 查询跳点" || text == "查询跳点" {
+				} else if cleanText == "/diff" || strings.Contains(normNoSpace, "查询跳点") {
 					isQueryCmd = true
 					queryMinutes = botDiffMinutes
-				} else if m := jumpLabelRe.FindStringSubmatch(text); m != nil {
+				} else if m := jumpLabelRe.FindStringSubmatch(cleanText); m != nil {
 					// 「🔍 30分钟跳点」样式（底部快捷键盘的第二键）：跟随标签里的数字
 					if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
 						isQueryCmd = true
 						queryMinutes = n
 					}
-				} else if strings.HasPrefix(text, "/check") || strings.HasPrefix(text, "/diff") || strings.HasPrefix(text, "/查") {
-					parts := strings.Fields(text)
+				} else if strings.HasPrefix(cleanText, "/check") || strings.HasPrefix(cleanText, "/diff") || strings.HasPrefix(cleanText, "/查") {
+					parts := strings.Fields(cleanText)
 					arg := ""
 					if len(parts) >= 2 {
 						arg = parts[1]
@@ -2908,9 +2954,9 @@ func runTGDaemon() {
 						isQueryCmd = true
 						queryMinutes = m
 					}
-				} else if matched, _ := regexp.MatchString(`^\d+\s*(?:分钟|min|m)$`, text); matched {
+				} else if matched, _ := regexp.MatchString(`^\d+\s*(?:分钟|min|m)$`, cleanText); matched {
 					re := regexp.MustCompile(`\d+`)
-					numStr := re.FindString(text)
+					numStr := re.FindString(cleanText)
 					if m, err := strconv.Atoi(numStr); err == nil && m > 0 {
 						isQueryCmd = true
 						queryMinutes = m
@@ -2986,6 +3032,10 @@ func runTGDaemon() {
 				}
 
 				chatID := strconv.FormatInt(cq.Message.Chat.ID, 10)
+				fromID := ""
+				if cq.From != nil {
+					fromID = strconv.FormatInt(cq.From.ID, 10)
+				}
 				curStore := loadStoreSafe()
 				owner := tgUserID
 				if owner == "" {
@@ -2993,7 +3043,7 @@ func runTGDaemon() {
 				}
 
 				qMin, accIdx, isRefresh := parseRefreshCallback(cq.Data)
-				if chatID == owner && isRefresh {
+				if (chatID == owner || fromID == owner) && isRefresh {
 					nowMs := time.Now().In(cst).UnixMilli()
 
 					// 冷却先于单飞锁检查：抢锁后再拒绝就必须手动回滚锁，
